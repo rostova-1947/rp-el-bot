@@ -11,7 +11,6 @@ import psycopg2.extras
 # Env
 # -----------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
-# Railway usually provides DATABASE_URL for managed Postgres when referenced correctly.
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("DATABASE_PRIVATE_URL")
@@ -19,7 +18,6 @@ DATABASE_URL = (
 )
 
 # Optional: make slash commands appear instantly in a single server
-# Set this to your server ID in Railway Variables, e.g. 123456789012345678
 GUILD_ID = os.getenv("GUILD_ID")  # optional
 
 # SSL: prefer is usually safest across hosted environments
@@ -102,6 +100,14 @@ def db_init() -> None:
         updated_by TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         reason TEXT
+    );
+    """)
+
+    # --- NEW: per-guild settings (log channel) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS guild_settings (
+        guild_id TEXT PRIMARY KEY,
+        log_channel_id TEXT
     );
     """)
 
@@ -340,7 +346,6 @@ def fetch_history(guild_id: str, name1: str, name2: str, rel_type: str, limit: i
 
 
 def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = None, limit: int = 10):
-    # If rel_type is None, return all types; otherwise filter
     con = db_connect()
     cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     if rel_type:
@@ -384,16 +389,142 @@ def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = No
 
 
 # -----------------------------
-# Display helpers
+# Guild settings DB helpers (log channel)
 # -----------------------------
-def stage_label(score: int) -> str:
-    if score <= -80: return "Nemeses"
-    if score <= -50: return "Enemies"
-    if score <= -20: return "Rivals"
-    if score <= 20:  return "Neutral"
-    if score <= 50:  return "Friends"
-    if score <= 80:  return "Close"
-    return "Soulmates"
+def get_log_channel_id(guild_id: str) -> Optional[int]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=%s", (guild_id,))
+    row = cur.fetchone()
+    cur.close()
+    con.close()
+    if not row or not row[0]:
+        return None
+    try:
+        return int(row[0])
+    except ValueError:
+        return None
+
+
+def set_log_channel_id(guild_id: str, channel_id: int) -> None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, log_channel_id)
+        VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = EXCLUDED.log_channel_id
+        """,
+        (guild_id, str(channel_id)),
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+
+def clear_log_channel_id(guild_id: str) -> None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, log_channel_id)
+        VALUES (%s, NULL)
+        ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = NULL
+        """,
+        (guild_id,),
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+
+# -----------------------------
+# Display helpers (Blackthorn-specific)
+# -----------------------------
+
+# Per-type thresholds (romantic progresses "faster"; familial "heavier")
+BLACKTHORN_STAGES = {
+    "romantic": [
+        (-85, "Blood in the Water"),
+        (-60, "Cutthroat"),
+        (-30, "Bad History"),
+        ( 10, "Playing It Cool"),
+        ( 35, "Slowburn"),
+        ( 65, "Back in the Saddle"),
+        (100, "Endgame"),
+    ],
+    "platonic": [
+        (-85, "Kill-on-Sight"),
+        (-60, "No-Contact"),
+        (-30, "Thin Ice"),
+        ( 20, "Town-Polite"),
+        ( 50, "Good Company"),
+        ( 80, "Ride-or-Die"),
+        (100, "Chosen Family"),
+    ],
+    "familial": [
+        (-90, "Scorched Earth"),
+        (-70, "Cut Off"),
+        (-40, "Bad Blood"),
+        ( 15, "Holding Pattern"),
+        ( 45, "Mending Fences"),
+        ( 75, "Blood & Bone"),
+        (100, "Unbreakable"),
+    ],
+}
+
+REL_TYPE_META = {
+    "romantic": {"emoji": "💘", "title": "Romantic"},
+    "platonic": {"emoji": "🤝", "title": "Platonic"},
+    "familial": {"emoji": "🧬", "title": "Familial"},
+}
+
+def stage_label(score: int, rel_type: str = "platonic") -> str:
+    rel_type = normalize_rel_type(rel_type)
+    score = clamp_score(score)
+    for upper, label in BLACKTHORN_STAGES[rel_type]:
+        if score <= upper:
+            return label
+    return BLACKTHORN_STAGES[rel_type][-1][1]
+
+def mood_line(score: int, rel_type: str) -> str:
+    rel_type = normalize_rel_type(rel_type)
+    score = clamp_score(score)
+
+    if rel_type == "romantic":
+        if score <= -85: return "Spite with a pulse. Somebody’s gonna bleed first."
+        if score <= -60: return "Every look is a dare. Every word lands like a hook."
+        if score <= -30: return "Chemistry they refuse to name. History they can’t outrun."
+        if score <=  10: return "Careful distance. Watching for weakness. Wanting anyway."
+        if score <=  35: return "Soft spots showing. Small mercies. Dangerous tenderness."
+        if score <=  65: return "They keep finding their way back. Even when it’s stupid."
+        return "It’s settled. This is the person they pick—again and again."
+
+    if rel_type == "familial":
+        if score <= -90: return "The kind of feud that poisons holidays."
+        if score <= -70: return "Doors closed. Names not spoken."
+        if score <= -40: return "Love is there—under the anger."
+        if score <=  15: return "Quiet tension. Things left unsaid on purpose."
+        if score <=  45: return "Trying. Showing up. Mending what can be mended."
+        if score <=  75: return "Loyalty that hurts. Pride that runs deep."
+        return "No matter what—blood shows up."
+
+    # platonic
+    if score <= -85: return "They’d cross the street rather than share air."
+    if score <= -60: return "Bad for business. Worse for the heart."
+    if score <= -30: return "One wrong move and it turns ugly."
+    if score <=  20: return "Civil. Not close. Not cruel."
+    if score <=  50: return "Easy laughs. Mutual respect. Same side, mostly."
+    if score <=  80: return "If it goes down, they’re in it together."
+    return "Family by choice. The real kind."
+
+def milestone_message(old_score: int, new_score: int, rel_type: str) -> Optional[str]:
+    rel_type = normalize_rel_type(rel_type)
+    old_stage = stage_label(old_score, rel_type)
+    new_stage = stage_label(new_score, rel_type)
+    if old_stage == new_stage:
+        return None
+    return f"🏁 **Milestone:** *{old_stage}* → **{new_stage}**"
 
 
 def meter_bar(score: int, width: int = 20) -> str:
@@ -416,6 +547,72 @@ def rel_type_title(rt: str) -> str:
     return rt.capitalize()
 
 
+def heat_emoji(score: int) -> str:
+    score = clamp_score(score)
+    if score <= -85: return "🟥"
+    if score <= -60: return "🔴"
+    if score <= -30: return "🟠"
+    if score <= 20:  return "🟡"
+    if score <= 50:  return "🟢"
+    if score <= 80:  return "🔵"
+    return "🟣"
+
+
+async def post_milestone_log(
+    interaction: discord.Interaction,
+    rel_type: str,
+    a: str,
+    b: str,
+    old_score: int,
+    new_score: int,
+    delta: Optional[int],
+    reason: Optional[str],
+):
+    """Logs ONLY milestones to the configured log channel (if set)."""
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return
+
+    milestone = milestone_message(old_score, new_score, rel_type)
+    if not milestone:
+        return  # milestones only
+
+    chan_id = get_log_channel_id(guild_id)
+    if not chan_id:
+        return  # no log channel set
+
+    channel = interaction.client.get_channel(chan_id)
+    if channel is None:
+        try:
+            channel = await interaction.client.fetch_channel(chan_id)
+        except Exception:
+            return
+
+    rel_type = normalize_rel_type(rel_type)
+    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
+
+    status = stage_label(new_score, rel_type)
+    mood = mood_line(new_score, rel_type)
+    heat = heat_emoji(new_score)
+
+    delta_part = f" `{delta:+d}`" if delta is not None else ""
+    reason_part = f"\n**Reason:** {reason}" if reason else ""
+
+    msg = (
+        f"{meta['emoji']} **{meta['title']} Milestone** — **{a} ↔ {b}**\n"
+        f"{milestone}\n"
+        f"{heat} **Score:** `{old_score}` → `{new_score}`{delta_part}  |  **Now:** **{status}**\n"
+        f"*{mood}*"
+        f"{reason_part}\n"
+        f"**By:** {interaction.user.mention}"
+    )
+
+    try:
+        await channel.send(msg)
+    except Exception:
+        return
+
+
 REL_TYPE_CHOICES = [
     app_commands.Choice(name="romantic", value="romantic"),
     app_commands.Choice(name="platonic", value="platonic"),
@@ -434,7 +631,6 @@ class RPBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        # If GUILD_ID is set, sync instantly to that server; otherwise global sync.
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -478,6 +674,7 @@ async def char_add(interaction: discord.Interaction, name: str):
 
     await interaction.response.send_message(f"Added character **{name}** ✅")
 
+
 @char_group.command(name="list", description="List all characters in this server.")
 async def char_list(interaction: discord.Interaction):
     guild_id = ensure_guild(interaction)
@@ -494,6 +691,7 @@ async def char_list(interaction: discord.Interaction):
 
     embed = discord.Embed(title="Characters", description=text)
     await interaction.response.send_message(embed=embed)
+
 
 @char_group.command(name="remove", description="Remove a character (and their relationships) from this server.")
 @app_commands.autocomplete(name=character_autocomplete)
@@ -512,8 +710,44 @@ client.tree.add_command(char_group)
 
 
 # -----------------------------
-# /rel group
+# /settings group (milestone log channel)
 # -----------------------------
+settings_group = app_commands.Group(name="settings", description="Server settings for the RP bot.")
+
+@settings_group.command(name="set-log-channel", description="Set a channel to receive milestone logs.")
+@app_commands.describe(channel="The channel to post milestone logs into")
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+
+    set_log_channel_id(guild_id, channel.id)
+    await interaction.response.send_message(f"✅ Milestone log channel set to {channel.mention}")
+
+@settings_group.command(name="clear-log-channel", description="Disable milestone logging.")
+async def clear_log_channel(interaction: discord.Interaction):
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+
+    clear_log_channel_id(guild_id)
+    await interaction.response.send_message("✅ Milestone logging disabled.")
+
+@settings_group.command(name="show", description="Show current server settings.")
+async def show_settings(interaction: discord.Interaction):
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+
+    chan_id = get_log_channel_id(guild_id)
+    if chan_id:
+        await interaction.response.send_message(f"📌 Milestone log channel: <#{chan_id}>")
+    else:
+        await interaction.response.send_message("📌 Milestone log channel: (not set)")
+
+client.tree.add_command(settings_group)
+
+
 # -----------------------------
 # /rel group
 # -----------------------------
@@ -551,13 +785,51 @@ async def rel_top(
     lines = []
     for r in rows:
         score = int(r["score"])
-        lines.append(f"• **{r['other']}** — `{score}` ({stage_label(score)})  ·  *{r['rel_type']}*")
+        rt = r["rel_type"]
+        lines.append(f"• **{r['other']}** — `{score}` ({stage_label(score, rt)})  ·  *{rt}*")
 
     title = f"Top relationships for {name}"
     if rel_type:
         title += f" ({rel_type_title(rel_type)})"
 
     embed = discord.Embed(title=title, description="\n".join(lines))
+    await interaction.response.send_message(embed=embed)
+
+
+@rel_group.command(name="view", description="View relationship meter between two characters.")
+@app_commands.choices(type=REL_TYPE_CHOICES)
+@app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
+async def rel_view(
+    interaction: discord.Interaction,
+    type: app_commands.Choice[str],
+    a: str,
+    b: str
+):
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+
+    a, b = a.strip(), b.strip()
+    if a.casefold() == b.casefold():
+        return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
+
+    rel_type = type.value
+    row = get_relationship(guild_id, a, b, rel_type)
+    score = int(row["score"]) if row else 0
+    note = row.get("note") if row else None
+
+    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
+    status = stage_label(score, rel_type)
+    mood = mood_line(score, rel_type)
+    heat = heat_emoji(score)
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} {meta['title']}: {a} ↔ {b}",
+        description=f"{heat} **{score}** • **{status}**\n`{meter_bar(score)}`\n*{mood}*",
+    )
+    if note:
+        embed.add_field(name="Note", value=note, inline=False)
+
     await interaction.response.send_message(embed=embed)
 
 
@@ -588,6 +860,7 @@ async def rel_set(
 
     prev = get_relationship(guild_id, a, b, rel_type)
     old = int(prev["score"]) if prev else 0
+
     final = upsert_relationship(
         guild_id=guild_id,
         name1=a,
@@ -600,14 +873,36 @@ async def rel_set(
         reason="SET",
     )
 
+    milestone = milestone_message(old, final, rel_type)
+
+    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
+    status = stage_label(final, rel_type)
+    mood = mood_line(final, rel_type)
+    heat = heat_emoji(final)
+
+    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*"
+    if milestone:
+        desc += f"\n\n{milestone}"
+
     embed = discord.Embed(
-        title=f"Set {rel_type_title(rel_type)}: {a} ↔ {b}",
-        description=f"`{meter_bar(final)}`\n**Score:** `{final}` • **Status:** **{stage_label(final)}**",
+        title=f"{meta['emoji']} Set {meta['title']}: {a} ↔ {b}",
+        description=desc,
     )
     if note:
         embed.add_field(name="Note", value=note, inline=False)
 
     await interaction.response.send_message(embed=embed)
+
+    await post_milestone_log(
+        interaction=interaction,
+        rel_type=rel_type,
+        a=a,
+        b=b,
+        old_score=old,
+        new_score=final,
+        delta=(final - old),
+        reason="SET",
+    )
 
 
 @rel_group.command(name="add", description="Adjust relationship score by a delta (e.g., -10 or +25).")
@@ -635,6 +930,9 @@ async def rel_add(
     if not character_exists(guild_id, a): add_character(guild_id, a)
     if not character_exists(guild_id, b): add_character(guild_id, b)
 
+    prev = get_relationship(guild_id, a, b, rel_type)
+    old_score = int(prev["score"]) if prev else 0
+
     final = add_to_relationship(
         guild_id=guild_id,
         name1=a,
@@ -645,14 +943,36 @@ async def rel_add(
         reason=reason
     )
 
-    embed = discord.Embed(
-        title=f"Updated {rel_type_title(rel_type)}: {a} ↔ {b}",
-        description=f"`{meter_bar(final)}`\n**Delta:** `{delta:+d}` → **Score:** `{final}` • **Status:** **{stage_label(final)}**",
-    )
+    milestone = milestone_message(old_score, final, rel_type)
+
+    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
+    status = stage_label(final, rel_type)
+    mood = mood_line(final, rel_type)
+    heat = heat_emoji(final)
+
+    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*\n\n**Delta:** `{delta:+d}`"
     if reason:
-        embed.add_field(name="Reason", value=reason, inline=False)
+        desc += f"\n**Reason:** {reason}"
+    if milestone:
+        desc += f"\n\n{milestone}"
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} Updated {meta['title']}: {a} ↔ {b}",
+        description=desc,
+    )
 
     await interaction.response.send_message(embed=embed)
+
+    await post_milestone_log(
+        interaction=interaction,
+        rel_type=rel_type,
+        a=a,
+        b=b,
+        old_score=old_score,
+        new_score=final,
+        delta=delta,
+        reason=reason,
+    )
 
 
 @rel_group.command(name="history", description="Show recent changes for a relationship meter.")
@@ -693,6 +1013,7 @@ async def rel_history(
 
 client.tree.add_command(rel_group)
 
+
 # -----------------------------
 # Run
 # -----------------------------
@@ -704,6 +1025,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
