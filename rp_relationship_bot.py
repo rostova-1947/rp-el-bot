@@ -37,15 +37,16 @@ def normalize_pair(name1: str, name2: str) -> Tuple[str, str]:
 def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS characters (
         id SERIAL PRIMARY KEY,
         guild_id TEXT NOT NULL,
         name TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE (guild_id, lower(name))
+        created_at TEXT NOT NULL
     );
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS relationships (
         id SERIAL PRIMARY KEY,
@@ -55,10 +56,10 @@ def db_init() -> None:
         score INTEGER NOT NULL,
         updated_by TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        note TEXT,
-        UNIQUE (guild_id, lower(a_name), lower(b_name))
+        note TEXT
     );
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS rel_history (
         id SERIAL PRIMARY KEY,
@@ -72,10 +73,21 @@ def db_init() -> None:
         reason TEXT
     );
     """)
+
+    # Unique indexes for case-insensitive uniqueness
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_characters_guild_lower_name
+    ON characters (guild_id, lower(name));
+    """)
+
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_relationships_guild_lower_pair
+    ON relationships (guild_id, lower(a_name), lower(b_name));
+    """)
+
     con.commit()
     cur.close()
     con.close()
-
 
 def character_exists(guild_id: str, name: str) -> bool:
     con = db_connect()
@@ -493,4 +505,5 @@ def main():
     client.run(TOKEN)
 
 if __name__ == "__main__":
+
     main()
