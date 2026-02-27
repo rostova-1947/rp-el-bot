@@ -38,6 +38,7 @@ def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
 
+    # --- Base tables ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS characters (
         id SERIAL PRIMARY KEY,
@@ -53,6 +54,7 @@ def db_init() -> None:
         guild_id TEXT NOT NULL,
         a_name TEXT NOT NULL,
         b_name TEXT NOT NULL,
+        rel_type TEXT,  -- will be made NOT NULL via migration below
         score INTEGER NOT NULL,
         updated_by TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -66,6 +68,7 @@ def db_init() -> None:
         guild_id TEXT NOT NULL,
         a_name TEXT NOT NULL,
         b_name TEXT NOT NULL,
+        rel_type TEXT,  -- will be made NOT NULL via migration below
         delta INTEGER NOT NULL,
         new_score INTEGER NOT NULL,
         updated_by TEXT NOT NULL,
@@ -74,15 +77,32 @@ def db_init() -> None:
     );
     """)
 
-    # Unique indexes for case-insensitive uniqueness
+    # --- Migration: ensure rel_type exists and is populated ---
+    # (Safe to run repeatedly)
+    cur.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS rel_type TEXT;")
+    cur.execute("ALTER TABLE rel_history ADD COLUMN IF NOT EXISTS rel_type TEXT;")
+
+    # Backfill existing rows (from your old single-meter system)
+    cur.execute("UPDATE relationships SET rel_type='platonic' WHERE rel_type IS NULL;")
+    cur.execute("UPDATE rel_history SET rel_type='platonic' WHERE rel_type IS NULL;")
+
+    # Make columns required going forward
+    cur.execute("ALTER TABLE relationships ALTER COLUMN rel_type SET NOT NULL;")
+    cur.execute("ALTER TABLE rel_history ALTER COLUMN rel_type SET NOT NULL;")
+
+    # --- Unique indexes for case-insensitive uniqueness ---
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS ux_characters_guild_lower_name
     ON characters (guild_id, lower(name));
     """)
 
+    # Old unique index doesn't include rel_type; drop it if it exists
+    cur.execute("DROP INDEX IF EXISTS ux_relationships_guild_lower_pair;")
+
+    # New unique index includes rel_type so meters can coexist per pair
     cur.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_relationships_guild_lower_pair
-    ON relationships (guild_id, lower(a_name), lower(b_name));
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_relationships_guild_lower_pair_type
+    ON relationships (guild_id, lower(a_name), lower(b_name), rel_type);
     """)
 
     con.commit()
@@ -507,3 +527,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
