@@ -514,10 +514,12 @@ client.tree.add_command(char_group)
 # -----------------------------
 # /rel group
 # -----------------------------
-@rel_group.command(
-    name="top",
-    description="Show strongest relationships for a character (optionally filter by type)."
-)
+# -----------------------------
+# /rel group
+# -----------------------------
+rel_group = app_commands.Group(name="rel", description="Track relationship meters between characters.")
+
+@rel_group.command(name="top", description="Show strongest relationships for a character (optionally filter by type).")
 @app_commands.describe(type="Optional: romantic / platonic / familial / all")
 @app_commands.choices(type=[
     app_commands.Choice(name="all", value="all"),
@@ -558,13 +560,14 @@ async def rel_top(
     embed = discord.Embed(title=title, description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
 
+
 @rel_group.command(name="set", description="Set relationship score (-100 to +100).")
 @app_commands.choices(type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(score="Integer from -100 to 100", note="Optional note")
 async def rel_set(
     interaction: discord.Interaction,
-    type: Optional[str] = "all"
+    type: app_commands.Choice[str],
     a: str,
     b: str,
     score: int,
@@ -580,7 +583,6 @@ async def rel_set(
 
     rel_type = type.value
 
-    # Auto-create characters if missing
     if not character_exists(guild_id, a): add_character(guild_id, a)
     if not character_exists(guild_id, b): add_character(guild_id, b)
 
@@ -609,6 +611,7 @@ async def rel_set(
 
 
 @rel_group.command(name="add", description="Adjust relationship score by a delta (e.g., -10 or +25).")
+@app_commands.choices(type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(delta="Change amount (e.g., -10 or +15)", reason="Optional reason")
 async def rel_add(
@@ -629,7 +632,6 @@ async def rel_add(
 
     rel_type = type.value
 
-    # Auto-create characters if missing
     if not character_exists(guild_id, a): add_character(guild_id, a)
     if not character_exists(guild_id, b): add_character(guild_id, b)
 
@@ -689,50 +691,7 @@ async def rel_history(
     await interaction.response.send_message(embed=embed)
 
 
-@rel_group.command(name="top", description="Show strongest relationships for a character (optionally filter by type).")
-@app_commands.describe(type="Optional: romantic / platonic / familial")
-@app_commands.choices(type=[*REL_TYPE_CHOICES, app_commands.Choice(name="all", value="all")])
-@app_commands.autocomplete(name=character_autocomplete)
-@rel_group.command(name="top", description="Show strongest relationships for a character (optionally filter by type).")
-@app_commands.describe(type="Optional: romantic / platonic / familial / all")
-@app_commands.choices(type=[
-    app_commands.Choice(name="all", value="all"),
-    app_commands.Choice(name="romantic", value="romantic"),
-    app_commands.Choice(name="platonic", value="platonic"),
-    app_commands.Choice(name="familial", value="familial"),
-])
-@app_commands.autocomplete(name=character_autocomplete)
-async def rel_top(
-    interaction: discord.Interaction,
-    name: str,
-    type: Optional[str] = "all",
-):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-
-    name = name.strip()
-    chosen = (type or "all").strip().lower()
-
-    rel_type = None if chosen == "all" else chosen
-    if rel_type is not None:
-        rel_type = normalize_rel_type(rel_type)
-
-    rows = top_relationships_for(guild_id, name, rel_type=rel_type, limit=10)
-    if not rows:
-        return await interaction.response.send_message(f"No relationships tracked yet for **{name}**.")
-
-    lines = []
-    for r in rows:
-        score = int(r["score"])
-        lines.append(f"• **{r['other']}** — `{score}` ({stage_label(score)})  ·  *{r['rel_type']}*")
-
-    title = f"Top relationships for {name}"
-    if rel_type:
-        title += f" ({rel_type_title(rel_type)})"
-
-    embed = discord.Embed(title=title, description="\n".join(lines))
-    await interaction.response.send_message(embed=embed)
+client.tree.add_command(rel_group)
 
 # -----------------------------
 # Run
@@ -745,5 +704,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
