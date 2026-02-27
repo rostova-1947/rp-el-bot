@@ -598,7 +598,6 @@ async def rel_set(
 
 
 @rel_group.command(name="add", description="Adjust relationship score by a delta (e.g., -10 or +25).")
-@app_commands.choices(type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(delta="Change amount (e.g., -10 or +15)", reason="Optional reason")
 async def rel_add(
@@ -683,17 +682,30 @@ async def rel_history(
 @app_commands.describe(type="Optional: romantic / platonic / familial")
 @app_commands.choices(type=[*REL_TYPE_CHOICES, app_commands.Choice(name="all", value="all")])
 @app_commands.autocomplete(name=character_autocomplete)
+@rel_group.command(name="top", description="Show strongest relationships for a character (optionally filter by type).")
+@app_commands.describe(type="Optional: romantic / platonic / familial / all")
+@app_commands.choices(type=[
+    app_commands.Choice(name="all", value="all"),
+    app_commands.Choice(name="romantic", value="romantic"),
+    app_commands.Choice(name="platonic", value="platonic"),
+    app_commands.Choice(name="familial", value="familial"),
+])
+@app_commands.autocomplete(name=character_autocomplete)
 async def rel_top(
     interaction: discord.Interaction,
     name: str,
-    type: app_commands.Choice[str] = app_commands.Choice(name="all", value="all")
+    type: Optional[str] = "all",
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
         return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
 
     name = name.strip()
-    rel_type = None if type.value == "all" else type.value
+    chosen = (type or "all").strip().lower()
+
+    rel_type = None if chosen == "all" else chosen
+    if rel_type is not None:
+        rel_type = normalize_rel_type(rel_type)
 
     rows = top_relationships_for(guild_id, name, rel_type=rel_type, limit=10)
     if not rows:
@@ -711,9 +723,6 @@ async def rel_top(
     embed = discord.Embed(title=title, description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
 
-client.tree.add_command(rel_group)
-
-
 # -----------------------------
 # Run
 # -----------------------------
@@ -725,3 +734,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
