@@ -514,38 +514,49 @@ client.tree.add_command(char_group)
 # -----------------------------
 # /rel group
 # -----------------------------
-rel_group = app_commands.Group(name="rel", description="Track relationship meters between characters.")
-
-@rel_group.command(name="view", description="View relationship meter between two characters.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-@app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
-async def rel_view(
+@rel_group.command(
+    name="top",
+    description="Show strongest relationships for a character (optionally filter by type)."
+)
+@app_commands.describe(type="Optional: romantic / platonic / familial / all")
+@app_commands.choices(type=[
+    app_commands.Choice(name="all", value="all"),
+    app_commands.Choice(name="romantic", value="romantic"),
+    app_commands.Choice(name="platonic", value="platonic"),
+    app_commands.Choice(name="familial", value="familial"),
+])
+@app_commands.autocomplete(name=character_autocomplete)
+async def rel_top(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
-    a: str,
-    b: str
+    name: str,
+    type: Optional[str] = "all",
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
         return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
 
-    a, b = a.strip(), b.strip()
-    if a.casefold() == b.casefold():
-        return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
+    name = name.strip()
+    chosen = (type or "all").strip().lower()
 
-    rel_type = type.value
-    row = get_relationship(guild_id, a, b, rel_type)
-    score = int(row["score"]) if row else 0
+    rel_type = None if chosen == "all" else chosen
+    if rel_type is not None:
+        rel_type = normalize_rel_type(rel_type)
 
-    embed = discord.Embed(
-        title=f"{rel_type_title(rel_type)}: {a} ↔ {b}",
-        description=f"`{meter_bar(score)}`\n**Score:** `{score}` • **Status:** **{stage_label(score)}**",
-    )
-    if row and row.get("note"):
-        embed.add_field(name="Note", value=row["note"], inline=False)
+    rows = top_relationships_for(guild_id, name, rel_type=rel_type, limit=10)
+    if not rows:
+        return await interaction.response.send_message(f"No relationships tracked yet for **{name}**.")
 
+    lines = []
+    for r in rows:
+        score = int(r["score"])
+        lines.append(f"• **{r['other']}** — `{score}` ({stage_label(score)})  ·  *{r['rel_type']}*")
+
+    title = f"Top relationships for {name}"
+    if rel_type:
+        title += f" ({rel_type_title(rel_type)})"
+
+    embed = discord.Embed(title=title, description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
-
 
 @rel_group.command(name="set", description="Set relationship score (-100 to +100).")
 @app_commands.choices(type=REL_TYPE_CHOICES)
@@ -553,7 +564,7 @@ async def rel_view(
 @app_commands.describe(score="Integer from -100 to 100", note="Optional note")
 async def rel_set(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
+    type: Optional[str] = "all"
     a: str,
     b: str,
     score: int,
@@ -734,4 +745,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
