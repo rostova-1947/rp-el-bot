@@ -1,34 +1,34 @@
 import os
-import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Tuple, Dict, Any
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional, List, Tuple, Dict
 
 import discord
 from discord import app_commands
 import psycopg2
 import psycopg2.extras
 
-
-# =============================
+# ============================================================
 # ENV
-# =============================
+# ============================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
-
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("DATABASE_PRIVATE_URL")
     or os.getenv("PGDATABASE_URL")
 )
 
-# Optional: instant command sync in a single server
-GUILD_ID = os.getenv("GUILD_ID")  # server id as string; optional
+# If set, slash commands sync instantly to that server (recommended while developing)
+GUILD_ID = os.getenv("GUILD_ID")  # optional
 
-PGSSLMODE = os.getenv("PGSSLMODE", "prefer")
+# SSL (Railway Postgres usually works with prefer/require)
+PGSSLMODE = os.getenv("PGSSLMODE", "prefer")  # try "require" if needed
 
 
-# =============================
+# ============================================================
 # REL TYPES
-# =============================
+# ============================================================
 REL_TYPES = ("romantic", "platonic", "familial")
 
 
@@ -47,31 +47,32 @@ REL_TYPE_CHOICES = [
     app_commands.Choice(name="familial", value="familial"),
 ]
 
-REL_TYPE_PLUS_ALL_CHOICES = [
-    app_commands.Choice(name="all", value="all"),
-    *REL_TYPE_CHOICES
+INTENSITY_CHOICES = [
+    app_commands.Choice(name="low", value="low"),
+    app_commands.Choice(name="med", value="med"),
+    app_commands.Choice(name="high", value="high"),
+]
+
+# This is the change you asked for:
+# users can force the roll to be Positive or Negative (or let it be Mixed)
+POLARITY_CHOICES = [
+    app_commands.Choice(name="mixed", value="mixed"),
+    app_commands.Choice(name="positive", value="positive"),
+    app_commands.Choice(name="negative", value="negative"),
 ]
 
 
-# =============================
-# TIME / DB HELPERS
-# =============================
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+# ============================================================
+# DB LAYER (POSTGRES)
+# ============================================================
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL. Add a Postgres database and set DATABASE_URL.")
+    return psycopg2.connect(DATABASE_URL, sslmode=PGSSLMODE)
 
 
 def now_iso() -> str:
-    return now_utc().isoformat(timespec="seconds")
-
-
-def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        # Python can parse Z? usually no; Railway gives +00:00
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def clamp_score(score: int) -> int:
@@ -83,32 +84,24 @@ def normalize_pair(name1: str, name2: str) -> Tuple[str, str]:
     return (n1, n2) if n1.casefold() < n2.casefold() else (n2, n1)
 
 
-def db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL. Add a Postgres database and set DATABASE_URL.")
-    return psycopg2.connect(DATABASE_URL, sslmode=PGSSLMODE)
-
-
-# =============================
-# DB INIT + MIGRATIONS
-# =============================
 def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
 
-    # Characters
-    cur.execute("""
+    # --- Base tables ---
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS characters (
         id SERIAL PRIMARY KEY,
         guild_id TEXT NOT NULL,
         name TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
-    """)
+    """
+    )
 
-    # Relationships
-    # NOTE: last_player_update_at is used for decay cooldown (decay never changes it)
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS relationships (
         id SERIAL PRIMARY KEY,
         guild_id TEXT NOT NULL,
@@ -118,13 +111,13 @@ def db_init() -> None:
         score INTEGER NOT NULL,
         updated_by TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        last_player_update_at TEXT,
         note TEXT
     );
-    """)
+    """
+    )
 
-    # History
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS rel_history (
         id SERIAL PRIMARY KEY,
         guild_id TEXT NOT NULL,
@@ -137,89 +130,48 @@ def db_init() -> None:
         updated_at TEXT NOT NULL,
         reason TEXT
     );
-    """)
+    """
+    )
 
-    # Server settings (milestone log channel)
-    cur.execute("""
+    # --- Per-guild settings (milestone log channel) ---
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS guild_settings (
         guild_id TEXT PRIMARY KEY,
         log_channel_id TEXT
     );
-    """)
+    """
+    )
 
-    # Decay settings (per guild + rel_type)
-    # paused_until applies server-wide (we store it redundantly per rel_type for simplicity)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rel_decay_settings (
-        guild_id TEXT NOT NULL,
-        rel_type TEXT NOT NULL,
-        enabled BOOLEAN NOT NULL DEFAULT FALSE,
-        decay_amount INTEGER NOT NULL DEFAULT 1,
-        interval_minutes INTEGER NOT NULL DEFAULT 360,
-        cooldown_minutes INTEGER NOT NULL DEFAULT 720,
-        paused_until TEXT,
-        freeze_familial BOOLEAN NOT NULL DEFAULT FALSE,
-        PRIMARY KEY (guild_id, rel_type)
-    );
-    """)
-
-    # Per-relationship freeze (no decay until freeze_until)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rel_freeze (
-        id SERIAL PRIMARY KEY,
-        guild_id TEXT NOT NULL,
-        a_name TEXT NOT NULL,
-        b_name TEXT NOT NULL,
-        rel_type TEXT NOT NULL,
-        freeze_until TEXT NOT NULL,
-        reason TEXT,
-        created_by TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    """)
-
-    # --- Migrations: ensure columns exist and are NOT NULL where needed ---
+    # --- Migration: ensure rel_type exists + backfill ---
     cur.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS rel_type TEXT;")
     cur.execute("ALTER TABLE rel_history ADD COLUMN IF NOT EXISTS rel_type TEXT;")
-    cur.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS last_player_update_at TEXT;")
-    cur.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS note TEXT;")
-
-    # Backfill existing rows
     cur.execute("UPDATE relationships SET rel_type='platonic' WHERE rel_type IS NULL;")
     cur.execute("UPDATE rel_history SET rel_type='platonic' WHERE rel_type IS NULL;")
-
-    # Enforce NOT NULL for rel_type (new + old rows now filled)
     cur.execute("ALTER TABLE relationships ALTER COLUMN rel_type SET NOT NULL;")
     cur.execute("ALTER TABLE rel_history ALTER COLUMN rel_type SET NOT NULL;")
 
-    # Unique indexes (case-insensitive)
-    cur.execute("""
+    # --- Unique indexes ---
+    cur.execute(
+        """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_characters_guild_lower_name
     ON characters (guild_id, lower(name));
-    """)
+    """
+    )
 
-    # Relationships unique per type
     cur.execute("DROP INDEX IF EXISTS ux_relationships_guild_lower_pair;")
-    cur.execute("""
+    cur.execute(
+        """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_relationships_guild_lower_pair_type
     ON relationships (guild_id, lower(a_name), lower(b_name), rel_type);
-    """)
-
-    # Freeze uniqueness (one active row per pair/type at a time is not enforced strictly,
-    # but we keep lookup fast)
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS ix_rel_freeze_lookup
-    ON rel_freeze (guild_id, lower(a_name), lower(b_name), rel_type);
-    """)
+    """
+    )
 
     con.commit()
     cur.close()
     con.close()
 
 
-# =============================
-# DB: CHARACTERS
-# =============================
 def character_exists(guild_id: str, name: str) -> bool:
     con = db_connect()
     cur = con.cursor()
@@ -259,17 +211,16 @@ def remove_character(guild_id: str, name: str) -> int:
         return 0
 
     stored = row[0]
-    cur.execute("DELETE FROM characters WHERE guild_id=%s AND lower(name)=lower(%s)", (guild_id, stored))
+    cur.execute(
+        "DELETE FROM characters WHERE guild_id=%s AND lower(name)=lower(%s)",
+        (guild_id, stored),
+    )
     cur.execute(
         "DELETE FROM relationships WHERE guild_id=%s AND (lower(a_name)=lower(%s) OR lower(b_name)=lower(%s))",
         (guild_id, stored, stored),
     )
     cur.execute(
         "DELETE FROM rel_history WHERE guild_id=%s AND (lower(a_name)=lower(%s) OR lower(b_name)=lower(%s))",
-        (guild_id, stored, stored),
-    )
-    cur.execute(
-        "DELETE FROM rel_freeze WHERE guild_id=%s AND (lower(a_name)=lower(%s) OR lower(b_name)=lower(%s))",
         (guild_id, stored, stored),
     )
     con.commit()
@@ -291,18 +242,14 @@ def list_characters(guild_id: str) -> List[str]:
     return [r[0] for r in rows]
 
 
-# =============================
-# DB: RELATIONSHIPS
-# =============================
-def get_relationship(guild_id: str, name1: str, name2: str, rel_type: str):
+def get_relationship(guild_id: str, name1: str, name2: str, rel_type: Optional[str] = None):
     rel_type = normalize_rel_type(rel_type)
     a, b = normalize_pair(name1, name2)
     con = db_connect()
     cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         """
-        SELECT *
-        FROM relationships
+        SELECT * FROM relationships
         WHERE guild_id=%s
           AND lower(a_name)=lower(%s)
           AND lower(b_name)=lower(%s)
@@ -326,7 +273,6 @@ def upsert_relationship(
     note: Optional[str],
     delta_for_history: int,
     reason: Optional[str],
-    is_player_action: bool = True,
 ) -> int:
     rel_type = normalize_rel_type(rel_type)
     a, b = normalize_pair(name1, name2)
@@ -338,8 +284,7 @@ def upsert_relationship(
 
     cur.execute(
         """
-        SELECT score
-        FROM relationships
+        SELECT score FROM relationships
         WHERE guild_id=%s
           AND lower(a_name)=lower(%s)
           AND lower(b_name)=lower(%s)
@@ -349,35 +294,27 @@ def upsert_relationship(
     )
     existing = cur.fetchone()
 
-    last_player_update = ts if is_player_action else None
-
     if existing is None:
         cur.execute(
             """
-            INSERT INTO relationships (guild_id, a_name, b_name, rel_type, score, updated_by, updated_at, last_player_update_at, note)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            INSERT INTO relationships (guild_id, a_name, b_name, rel_type, score, updated_by, updated_at, note)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """,
-            (guild_id, a, b, rel_type, new_score, updated_by, ts, last_player_update, note),
+            (guild_id, a, b, rel_type, new_score, updated_by, ts, note),
         )
     else:
-        # Only update last_player_update_at if this is a player action
         cur.execute(
             """
             UPDATE relationships
-            SET score=%s,
-                updated_by=%s,
-                updated_at=%s,
-                last_player_update_at = CASE WHEN %s IS NULL THEN last_player_update_at ELSE %s END,
-                note=COALESCE(%s, note)
+            SET score=%s, updated_by=%s, updated_at=%s, note=COALESCE(%s, note)
             WHERE guild_id=%s
               AND lower(a_name)=lower(%s)
               AND lower(b_name)=lower(%s)
               AND rel_type=%s
             """,
-            (new_score, updated_by, ts, last_player_update, last_player_update, note, guild_id, a, b, rel_type),
+            (new_score, updated_by, ts, note, guild_id, a, b, rel_type),
         )
 
-    # History row
     cur.execute(
         """
         INSERT INTO rel_history (guild_id, a_name, b_name, rel_type, delta, new_score, updated_by, updated_at, reason)
@@ -414,7 +351,6 @@ def add_to_relationship(
         note=None,
         delta_for_history=int(delta),
         reason=reason,
-        is_player_action=True,
     )
 
 
@@ -425,8 +361,7 @@ def fetch_history(guild_id: str, name1: str, name2: str, rel_type: str, limit: i
     cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         """
-        SELECT *
-        FROM rel_history
+        SELECT * FROM rel_history
         WHERE guild_id=%s
           AND lower(a_name)=lower(%s)
           AND lower(b_name)=lower(%s)
@@ -450,7 +385,10 @@ def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = No
         cur.execute(
             """
             SELECT *,
-                   CASE WHEN lower(a_name)=lower(%s) THEN b_name ELSE a_name END AS other
+            CASE
+                WHEN lower(a_name)=lower(%s) THEN b_name
+                ELSE a_name
+            END AS other
             FROM relationships
             WHERE guild_id=%s
               AND (lower(a_name)=lower(%s) OR lower(b_name)=lower(%s))
@@ -464,7 +402,10 @@ def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = No
         cur.execute(
             """
             SELECT *,
-                   CASE WHEN lower(a_name)=lower(%s) THEN b_name ELSE a_name END AS other
+            CASE
+                WHEN lower(a_name)=lower(%s) THEN b_name
+                ELSE a_name
+            END AS other
             FROM relationships
             WHERE guild_id=%s
               AND (lower(a_name)=lower(%s) OR lower(b_name)=lower(%s))
@@ -479,9 +420,9 @@ def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = No
     return rows
 
 
-# =============================
-# DB: GUILD SETTINGS (LOG CHANNEL)
-# =============================
+# ============================================================
+# GUILD SETTINGS (MILESTONE LOG CHANNEL)
+# ============================================================
 def get_log_channel_id(guild_id: str) -> Optional[int]:
     con = db_connect()
     cur = con.cursor()
@@ -529,189 +470,35 @@ def clear_log_channel_id(guild_id: str) -> None:
     con.close()
 
 
-# =============================
-# DB: DECAY SETTINGS + FREEZE
-# =============================
-def ensure_decay_rows(guild_id: str) -> None:
-    con = db_connect()
-    cur = con.cursor()
-    for rt in REL_TYPES:
-        cur.execute(
-            """
-            INSERT INTO rel_decay_settings (guild_id, rel_type)
-            VALUES (%s, %s)
-            ON CONFLICT (guild_id, rel_type) DO NOTHING
-            """,
-            (guild_id, rt),
-        )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-def get_decay_settings_rows(guild_id: str) -> List[Dict[str, Any]]:
-    ensure_decay_rows(guild_id)
-    con = db_connect()
-    cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "SELECT * FROM rel_decay_settings WHERE guild_id=%s ORDER BY rel_type ASC",
-        (guild_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    con.close()
-    return rows
-
-
-def set_decay_settings(
-    guild_id: str,
-    rel_type: str,
-    enabled: Optional[bool] = None,
-    decay_amount: Optional[int] = None,
-    interval_minutes: Optional[int] = None,
-    cooldown_minutes: Optional[int] = None,
-    paused_until: Optional[str] = None,
-    freeze_familial: Optional[bool] = None,
-) -> None:
-    rel_type = normalize_rel_type(rel_type)
-    ensure_decay_rows(guild_id)
-
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        UPDATE rel_decay_settings
-        SET enabled = COALESCE(%s, enabled),
-            decay_amount = COALESCE(%s, decay_amount),
-            interval_minutes = COALESCE(%s, interval_minutes),
-            cooldown_minutes = COALESCE(%s, cooldown_minutes),
-            paused_until = COALESCE(%s, paused_until),
-            freeze_familial = COALESCE(%s, freeze_familial)
-        WHERE guild_id=%s AND rel_type=%s
-        """,
-        (enabled, decay_amount, interval_minutes, cooldown_minutes, paused_until, freeze_familial, guild_id, rel_type),
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-def set_pause_all_decay(guild_id: str, until_iso: Optional[str]) -> None:
-    ensure_decay_rows(guild_id)
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        UPDATE rel_decay_settings
-        SET paused_until=%s
-        WHERE guild_id=%s
-        """,
-        (until_iso, guild_id),
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-def upsert_freeze(
-    guild_id: str,
-    name1: str,
-    name2: str,
-    rel_type: str,
-    freeze_until_iso: str,
-    reason: Optional[str],
-    created_by: str,
-) -> None:
-    rel_type = normalize_rel_type(rel_type)
-    a, b = normalize_pair(name1, name2)
-    con = db_connect()
-    cur = con.cursor()
-    # We "upsert" by deleting existing and inserting one new row (simple + reliable).
-    cur.execute(
-        """
-        DELETE FROM rel_freeze
-        WHERE guild_id=%s AND lower(a_name)=lower(%s) AND lower(b_name)=lower(%s) AND rel_type=%s
-        """,
-        (guild_id, a, b, rel_type),
-    )
-    cur.execute(
-        """
-        INSERT INTO rel_freeze (guild_id, a_name, b_name, rel_type, freeze_until, reason, created_by, created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (guild_id, a, b, rel_type, freeze_until_iso, reason, created_by, now_iso()),
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-def clear_freeze(guild_id: str, name1: str, name2: str, rel_type: str) -> int:
-    rel_type = normalize_rel_type(rel_type)
-    a, b = normalize_pair(name1, name2)
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        DELETE FROM rel_freeze
-        WHERE guild_id=%s AND lower(a_name)=lower(%s) AND lower(b_name)=lower(%s) AND rel_type=%s
-        """,
-        (guild_id, a, b, rel_type),
-    )
-    deleted = cur.rowcount
-    con.commit()
-    cur.close()
-    con.close()
-    return deleted
-
-
-def list_freezes(guild_id: str) -> List[Dict[str, Any]]:
-    con = db_connect()
-    cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        """
-        SELECT *
-        FROM rel_freeze
-        WHERE guild_id=%s
-        ORDER BY rel_type ASC, lower(a_name) ASC, lower(b_name) ASC
-        """,
-        (guild_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    con.close()
-    return rows
-
-
-# =============================
-# BLACKTHORN COSMETICS
-# =============================
+# ============================================================
+# BLACKTHORN DISPLAY HELPERS + MILESTONES
+# ============================================================
 BLACKTHORN_STAGES = {
     "romantic": [
         (-85, "Blood in the Water"),
         (-60, "Cutthroat"),
         (-30, "Bad History"),
-        ( 10, "Playing It Cool"),
-        ( 35, "Slowburn"),
-        ( 65, "Back in the Saddle"),
+        (10, "Playing It Cool"),
+        (35, "Slowburn"),
+        (65, "Back in the Saddle"),
         (100, "Endgame"),
     ],
     "platonic": [
         (-85, "Kill-on-Sight"),
         (-60, "No-Contact"),
         (-30, "Thin Ice"),
-        ( 20, "Town-Polite"),
-        ( 50, "Good Company"),
-        ( 80, "Ride-or-Die"),
+        (20, "Town-Polite"),
+        (50, "Good Company"),
+        (80, "Ride-or-Die"),
         (100, "Chosen Family"),
     ],
     "familial": [
         (-90, "Scorched Earth"),
         (-70, "Cut Off"),
         (-40, "Bad Blood"),
-        ( 15, "Holding Pattern"),
-        ( 45, "Mending Fences"),
-        ( 75, "Blood & Bone"),
+        (15, "Holding Pattern"),
+        (45, "Mending Fences"),
+        (75, "Blood & Bone"),
         (100, "Unbreakable"),
     ],
 }
@@ -722,16 +509,14 @@ REL_TYPE_META = {
     "familial": {"emoji": "🧬", "title": "Familial"},
 }
 
-# Simple color palette by "heat"
-def heat_color(score: int) -> int:
-    score = clamp_score(score)
-    if score <= -85: return 0x8B0000  # dark red
-    if score <= -60: return 0xC0392B
-    if score <= -30: return 0xE67E22
-    if score <=  20: return 0xF1C40F
-    if score <=  50: return 0x2ECC71
-    if score <=  80: return 0x3498DB
-    return 0x9B59B6
+
+def ensure_guild(interaction: discord.Interaction) -> Optional[str]:
+    return str(interaction.guild.id) if interaction.guild else None
+
+
+def rel_type_title(rt: str) -> str:
+    rt = normalize_rel_type(rt)
+    return rt.capitalize()
 
 
 def stage_label(score: int, rel_type: str = "platonic") -> str:
@@ -748,30 +533,48 @@ def mood_line(score: int, rel_type: str) -> str:
     score = clamp_score(score)
 
     if rel_type == "romantic":
-        if score <= -85: return "Spite with a pulse. Somebody’s gonna bleed first."
-        if score <= -60: return "Every look is a dare. Every word lands like a hook."
-        if score <= -30: return "Chemistry they refuse to name. History they can’t outrun."
-        if score <=  10: return "Careful distance. Watching for weakness. Wanting anyway."
-        if score <=  35: return "Soft spots showing. Small mercies. Dangerous tenderness."
-        if score <=  65: return "They keep finding their way back. Even when it’s stupid."
+        if score <= -85:
+            return "Spite with a pulse. Somebody’s gonna bleed first."
+        if score <= -60:
+            return "Every look is a dare. Every word lands like a hook."
+        if score <= -30:
+            return "Chemistry they refuse to name. History they can’t outrun."
+        if score <= 10:
+            return "Careful distance. Watching for weakness. Wanting anyway."
+        if score <= 35:
+            return "Soft spots showing. Small mercies. Dangerous tenderness."
+        if score <= 65:
+            return "They keep finding their way back. Even when it’s stupid."
         return "It’s settled. This is the person they pick—again and again."
 
     if rel_type == "familial":
-        if score <= -90: return "The kind of feud that poisons holidays."
-        if score <= -70: return "Doors closed. Names not spoken."
-        if score <= -40: return "Love is there—under the anger."
-        if score <=  15: return "Quiet tension. Things left unsaid on purpose."
-        if score <=  45: return "Trying. Showing up. Mending what can be mended."
-        if score <=  75: return "Loyalty that hurts. Pride that runs deep."
+        if score <= -90:
+            return "The kind of feud that poisons holidays."
+        if score <= -70:
+            return "Doors closed. Names not spoken."
+        if score <= -40:
+            return "Love is there—under the anger."
+        if score <= 15:
+            return "Quiet tension. Things left unsaid on purpose."
+        if score <= 45:
+            return "Trying. Showing up. Mending what can be mended."
+        if score <= 75:
+            return "Loyalty that hurts. Pride that runs deep."
         return "No matter what—blood shows up."
 
     # platonic
-    if score <= -85: return "They’d cross the street rather than share air."
-    if score <= -60: return "Bad for business. Worse for the heart."
-    if score <= -30: return "One wrong move and it turns ugly."
-    if score <=  20: return "Civil. Not close. Not cruel."
-    if score <=  50: return "Easy laughs. Mutual respect. Same side, mostly."
-    if score <=  80: return "If it goes down, they’re in it together."
+    if score <= -85:
+        return "They’d cross the street rather than share air."
+    if score <= -60:
+        return "Bad for business. Worse for the heart."
+    if score <= -30:
+        return "One wrong move and it turns ugly."
+    if score <= 20:
+        return "Civil. Not close. Not cruel."
+    if score <= 50:
+        return "Easy laughs. Mutual respect. Same side, mostly."
+    if score <= 80:
+        return "If it goes down, they’re in it together."
     return "Family by choice. The real kind."
 
 
@@ -784,54 +587,32 @@ def milestone_message(old_score: int, new_score: int, rel_type: str) -> Optional
     return f"🏁 **Milestone:** *{old_stage}* → **{new_stage}**"
 
 
-def heat_emoji(score: int) -> str:
-    score = clamp_score(score)
-    if score <= -85: return "🟥"
-    if score <= -60: return "🔴"
-    if score <= -30: return "🟠"
-    if score <=  20: return "🟡"
-    if score <=  50: return "🟢"
-    if score <=  80: return "🔵"
-    return "🟣"
-
-
-def meter_bar(score: int, width: int = 20) -> str:
+def meter_bar(score: int, width: int = 22) -> str:
     score = clamp_score(score)
     filled = int(round(((score + 100) / 200) * width))
     filled = max(0, min(width, filled))
     bar = "█" * filled + "░" * (width - filled)
     mid = width // 2
-    bar_list = list(bar)
-    bar_list[mid] = "┃"
-    return "".join(bar_list)
+    bl = list(bar)
+    bl[mid] = "┃"
+    return "".join(bl)
 
 
-def ensure_guild(interaction: discord.Interaction) -> Optional[str]:
-    return str(interaction.guild.id) if interaction.guild else None
-
-
-def rel_type_title(rt: str) -> str:
-    return normalize_rel_type(rt).capitalize()
-
-
-def build_rel_embed(rel_type: str, a: str, b: str, score: int, note: Optional[str] = None, extra: Optional[str] = None) -> discord.Embed:
-    rel_type = normalize_rel_type(rel_type)
-    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
-    status = stage_label(score, rel_type)
-    mood = mood_line(score, rel_type)
-    heat = heat_emoji(score)
-
-    embed = discord.Embed(
-        title=f"{meta['emoji']} {meta['title']}: {a} ↔ {b}",
-        description=f"{heat} **{score}** • **{status}**\n`{meter_bar(score)}`\n*{mood}*",
-        color=heat_color(score),
-    )
-    if note:
-        embed.add_field(name="Note", value=note, inline=False)
-    if extra:
-        embed.add_field(name="Update", value=extra, inline=False)
-    embed.set_footer(text="Blackthorn Relationship System")
-    return embed
+def heat_emoji(score: int) -> str:
+    score = clamp_score(score)
+    if score <= -85:
+        return "🟥"
+    if score <= -60:
+        return "🔴"
+    if score <= -30:
+        return "🟠"
+    if score <= 20:
+        return "🟡"
+    if score <= 50:
+        return "🟢"
+    if score <= 80:
+        return "🔵"
+    return "🟣"
 
 
 async def post_milestone_log(
@@ -889,182 +670,149 @@ async def post_milestone_log(
         return
 
 
-# =============================
-# DECAY ENGINE (WITH HISTORY)
-# =============================
-def apply_decay_tick_with_history(
-    guild_id: str,
-    rel_type: str,
-    decay_amount: int,
-    cooldown_minutes: int,
-) -> int:
-    """
-    Apply a decay tick for one guild+type:
-    - move score toward 0 by decay_amount
-    - skip if last_player_update_at is within cooldown
-    - skip if relationship is frozen (freeze_until > now)
-    - write a rel_history row for each updated relationship (reason='DECAY', updated_by='DECAY')
-    Returns number of relationships updated.
-    """
+# ============================================================
+# EVENT TABLE → POSITIVE OR NEGATIVE FILTER
+# ============================================================
+@dataclass(frozen=True)
+class EventDef:
+    title: str
+    description: str
+    delta: int  # positive or negative
+
+
+EVENT_TABLE: Dict[str, Dict[str, List[EventDef]]] = {
+    "romantic": {
+        "low": [
+            EventDef("Arena Lights", "Caught staring too long under the arena lights. Neither looks away first.", +5),
+            EventDef("Shared Cigarette", "A cigarette passed between them like a truce no one agreed to out loud.", +3),
+            EventDef("Sharp Words, Soft Eyes", "They snap, but the way they watch each other gives it away.", +2),
+            EventDef("Bad Timing", "They reach for each other—then remember they’re not supposed to.", -3),
+            EventDef("Old Wound (Mentioned)", "Somebody brings up Teddy. The air goes cold. Old pain resurfaces.", -5),
+            EventDef("Diner Humiliation", "A public comment lands wrong at the diner. Everyone hears it.", -6),
+        ],
+        "med": [
+            EventDef("Porch Patch-Up", "A patch-up on the porch at 2am. Quiet voices. No witnesses.", +10),
+            EventDef("Jealousy Spike", "Someone laughs too close to one of them. The other goes rigid.", +6),
+            EventDef("Truck Bed Confession", "In the truck bed, under stars, the truth leaks out in pieces.", +8),
+            EventDef("Public Humiliation", "A public humiliation at the diner. Pride gets dragged through gravel.", -12),
+            EventDef("Old Wound Reopened", "The Teddy subject isn’t avoided this time. It cracks something open.", -10),
+            EventDef("Fistfight Energy", "It’s not a fight… but it feels like one. One wrong word and it’ll swing.", -8),
+        ],
+        "high": [
+            EventDef("End of the Leash", "They finally say what they’ve been circling for months. It’s ugly and honest.", +15),
+            EventDef("Aftercare", "Bandages, water, steady hands. The kind of care that changes things.", +12),
+            EventDef("Kiss Like a Threat", "It’s not tender. It’s a decision. A line crossed on purpose.", +14),
+            EventDef("Burned Bridge", "A betrayal—real or perceived. Something breaks in a way that echoes.", -18),
+            EventDef("Ranch War", "The families get involved. They choose sides. The choosing hurts.", -15),
+            EventDef("Cruel in Public", "They go cruel in public to protect a private softness. The damage is real.", -16),
+        ],
+    },
+    "platonic": {
+        "low": [
+            EventDef("Shared Work", "Fences, feed, and silence. Respect earned the old way.", +4),
+            EventDef("Inside Joke", "A small joke lands. For a second, it feels easy.", +3),
+            EventDef("Town-Polite", "A nod in passing. Civil. Not warm—managed.", +2),
+            EventDef("Thin Ice", "A harmless comment hits a nerve. The mood shifts fast.", -3),
+            EventDef("Shoulder Check", "A deliberate shoulder check—petty, but pointed.", -2),
+            EventDef("Bad Rumor", "They hear something said behind their back. They don’t forget.", -4),
+        ],
+        "med": [
+            EventDef("Backed Up", "When it counted, they showed up. No questions. No hesitation.", +10),
+            EventDef("Ride Together", "Same truck, same road, same problem. Suddenly they’re a team.", +8),
+            EventDef("Saved Face", "One of them saves the other’s dignity in front of the town.", +7),
+            EventDef("Public Argument", "Voices raised where everyone can hear. Pride takes the wheel.", -9),
+            EventDef("Crossed Line", "Someone crosses a boundary. The apology comes late.", -10),
+            EventDef("No Contact", "They shut the door. Not dramatic—final.", -12),
+        ],
+        "high": [
+            EventDef("Ride-or-Die", "They go down together before they go down alone.", +15),
+            EventDef("Chosen Family", "Not blood. Better. They claim each other anyway.", +16),
+            EventDef("Kept the Secret", "A secret held, a risk taken. Loyalty proven.", +14),
+            EventDef("Betrayal", "They sell each other out—on purpose or by accident. Either way: bitter.", -16),
+            EventDef("Hands Thrown", "It goes physical. Not playful. Nobody wins.", -18),
+            EventDef("Cut Deep", "Words said that can’t be unsaid. The town will repeat them for weeks.", -15),
+        ],
+    },
+    "familial": {
+        "low": [
+            EventDef("Showed Up", "They show up anyway. That’s the whole love language.", +4),
+            EventDef("Kitchen Truce", "Coffee poured. Plates set. A truce made with chores and silence.", +3),
+            EventDef("Small Mercy", "An apology in actions, not words.", +2),
+            EventDef("Old Grudge", "An old grudge slips out mid-sentence. Everybody tenses.", -4),
+            EventDef("Cold Shoulder", "They freeze each other out like it’s second nature.", -3),
+            EventDef("Bad Blood", "Someone brings up the past like it’s a weapon.", -5),
+        ],
+        "med": [
+            EventDef("Mending Fences", "Actual fences, and the other kind. They work without speaking much.", +10),
+            EventDef("Protective Instinct", "Family closes ranks. Somebody gets protected whether they deserve it or not.", +8),
+            EventDef("Blood & Bone", "They take the hit for each other. Without asking.", +12),
+            EventDef("Cut Off", "They cut contact. Holiday-level consequences.", -12),
+            EventDef("Blowup", "It’s a blowup that rattles the whole house.", -10),
+            EventDef("Line in the Sand", "A line gets drawn. Somebody stands on the wrong side.", -11),
+        ],
+        "high": [
+            EventDef("Unbreakable", "They prove it: no matter what, they show up.", +16),
+            EventDef("Shared Grief", "Grief softens what anger couldn’t. They let each other in.", +14),
+            EventDef("Protect the Name", "They defend the family name like it’s sacred.", +12),
+            EventDef("Scorched Earth", "They go scorched earth. Thanksgivings will remember.", -18),
+            EventDef("Inheritance Fight", "Money, land, legacy—every old wound shows its teeth.", -16),
+            EventDef("Public Shame", "Family business becomes town business. Shame spreads fast.", -15),
+        ],
+    },
+}
+
+
+def _polarity_filter(events: List[EventDef], polarity: str) -> List[EventDef]:
+    p = (polarity or "mixed").strip().lower()
+    if p == "positive":
+        return [e for e in events if e.delta > 0] or events
+    if p == "negative":
+        return [e for e in events if e.delta < 0] or events
+    return events
+
+
+def roll_event(rel_type: str, intensity: str, polarity: str, seed: int) -> EventDef:
     rel_type = normalize_rel_type(rel_type)
-    decay_amount = max(1, int(decay_amount))
-    cooldown_minutes = max(0, int(cooldown_minutes))
+    intensity = (intensity or "med").strip().lower()
+    if intensity not in ("low", "med", "high"):
+        intensity = "med"
 
-    ts = now_iso()
-    cutoff = (now_utc() - timedelta(minutes=cooldown_minutes)).isoformat(timespec="seconds")
+    base = EVENT_TABLE[rel_type][intensity]
+    pool = _polarity_filter(base, polarity)
 
-    con = db_connect()
-    cur = con.cursor()
-
-    # CTE: choose candidates, update, then insert history rows with delta.
-    cur.execute(
-        """
-        WITH candidates AS (
-            SELECT r.id, r.guild_id, r.a_name, r.b_name, r.rel_type, r.score AS old_score
-            FROM relationships r
-            WHERE r.guild_id=%s
-              AND r.rel_type=%s
-              AND r.score <> 0
-              AND (r.last_player_update_at IS NULL OR r.last_player_update_at <= %s)
-              AND NOT EXISTS (
-                SELECT 1
-                FROM rel_freeze f
-                WHERE f.guild_id = r.guild_id
-                  AND f.rel_type = r.rel_type
-                  AND lower(f.a_name) = lower(r.a_name)
-                  AND lower(f.b_name) = lower(r.b_name)
-                  AND f.freeze_until > %s
-              )
-        ),
-        updated AS (
-            UPDATE relationships r
-            SET score = CASE
-                WHEN r.score > 0 THEN GREATEST(0, r.score - %s)
-                WHEN r.score < 0 THEN LEAST(0, r.score + %s)
-                ELSE 0
-            END,
-            updated_by = 'DECAY',
-            updated_at = %s
-            FROM candidates c
-            WHERE r.id = c.id
-            RETURNING r.guild_id, r.a_name, r.b_name, r.rel_type, c.old_score, r.score AS new_score
-        )
-        INSERT INTO rel_history (guild_id, a_name, b_name, rel_type, delta, new_score, updated_by, updated_at, reason)
-        SELECT guild_id,
-               a_name,
-               b_name,
-               rel_type,
-               (new_score - old_score) AS delta,
-               new_score,
-               'DECAY',
-               %s,
-               'DECAY'
-        FROM updated
-        """,
-        (guild_id, rel_type, cutoff, ts, decay_amount, decay_amount, ts, ts),
-    )
-
-    # rowcount here is inserted history count (same as updated count)
-    updated_count = cur.rowcount
-
-    con.commit()
-    cur.close()
-    con.close()
-    return max(0, updated_count)
+    rng = random.Random(seed)  # deterministic per interaction.id
+    return rng.choice(pool)
 
 
-# =============================
-# DISCORD BOT
-# =============================
+# ============================================================
+# DISCORD BOT (SLASH COMMANDS)
+# ============================================================
 intents = discord.Intents.default()
-intents.guilds = True  # ensure guild info is available for app commands
 
 
 class RPBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.decay_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
-        # Register command groups BEFORE syncing
+        # Add groups BEFORE syncing (fixes "commands not appearing")
         self.tree.add_command(char_group)
-        self.tree.add_command(settings_group)
         self.tree.add_command(rel_group)
-        self.tree.add_command(decay_group)
+        self.tree.add_command(settings_group)
+        self.tree.add_command(event_group)
 
-        # Sync commands
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            print(f"[sync] Synced commands to guild {GUILD_ID}")
         else:
             await self.tree.sync()
-            print("[sync] Synced global commands (may take time to propagate)")
-
-        # Start decay background loop
-        if self.decay_task is None:
-            self.decay_task = asyncio.create_task(self._decay_loop())
-
-    async def _decay_loop(self):
-        await self.wait_until_ready()
-        last_run: Dict[Tuple[str, str], datetime] = {}
-
-        while not self.is_closed():
-            try:
-                for g in self.guilds:
-                    guild_id = str(g.id)
-                    rows = get_decay_settings_rows(guild_id)
-
-                    # Evaluate paused_until once (server-wide; stored in each row)
-                    paused_until_iso = rows[0].get("paused_until") if rows else None
-                    paused_until_dt = parse_iso(paused_until_iso)
-                    if paused_until_dt and now_utc() < paused_until_dt:
-                        continue
-
-                    for s in rows:
-                        rt = s["rel_type"]
-                        enabled = bool(s["enabled"])
-                        decay_amount = int(s["decay_amount"])
-                        interval_minutes = int(s["interval_minutes"])
-                        cooldown_minutes = int(s["cooldown_minutes"])
-                        freeze_familial = bool(s.get("freeze_familial", False))
-
-                        if not enabled:
-                            continue
-                        if freeze_familial and rt == "familial":
-                            continue
-
-                        key = (guild_id, rt)
-                        now = now_utc()
-                        last = last_run.get(key)
-
-                        if last is None:
-                            last_run[key] = now
-                            continue
-
-                        elapsed_min = (now - last).total_seconds() / 60.0
-                        if elapsed_min >= max(1, interval_minutes):
-                            apply_decay_tick_with_history(
-                                guild_id=guild_id,
-                                rel_type=rt,
-                                decay_amount=decay_amount,
-                                cooldown_minutes=cooldown_minutes,
-                            )
-                            last_run[key] = now
-            except Exception:
-                # keep bot alive
-                pass
-
-            await asyncio.sleep(60)
 
 
 client = RPBot()
 
 
-# =============================
-# AUTOCOMPLETE
-# =============================
 async def character_autocomplete(interaction: discord.Interaction, current: str):
     guild_id = ensure_guild(interaction)
     if not guild_id:
@@ -1075,9 +823,9 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     return [app_commands.Choice(name=c, value=c) for c in filtered[:25]]
 
 
-# =============================
-# /char GROUP
-# =============================
+# ============================================================
+# /CHAR GROUP
+# ============================================================
 char_group = app_commands.Group(name="char", description="Manage RP characters (per server).")
 
 
@@ -1112,9 +860,9 @@ async def char_list(interaction: discord.Interaction):
 
     text = "\n".join(f"• {c}" for c in chars[:100])
     if len(chars) > 100:
-        text += f"\n… and {len(chars)-100} more."
+        text += f"\n… and {len(chars) - 100} more."
 
-    embed = discord.Embed(title="Characters", description=text, color=0x95A5A6)
+    embed = discord.Embed(title="Characters", description=text)
     await interaction.response.send_message(embed=embed)
 
 
@@ -1132,9 +880,9 @@ async def char_remove(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(f"Removed **{name}** (and any linked relationships). 🗑️")
 
 
-# =============================
-# /settings GROUP (LOG CHANNEL)
-# =============================
+# ============================================================
+# /SETTINGS GROUP (LOG CHANNEL)
+# ============================================================
 settings_group = app_commands.Group(name="settings", description="Server settings for the RP bot.")
 
 
@@ -1167,58 +915,25 @@ async def show_settings(interaction: discord.Interaction):
 
     chan_id = get_log_channel_id(guild_id)
     if chan_id:
-        await interaction.response.send_message(f"📌 Milestone log channel: <#{chan_id}>", ephemeral=True)
+        await interaction.response.send_message(f"📌 Milestone log channel: <#{chan_id}>")
     else:
-        await interaction.response.send_message("📌 Milestone log channel: (not set)", ephemeral=True)
+        await interaction.response.send_message("📌 Milestone log channel: (not set)")
 
 
-# =============================
-# /rel GROUP
-# =============================
+# ============================================================
+# /REL GROUP
+# ============================================================
 rel_group = app_commands.Group(name="rel", description="Track relationship meters between characters.")
 
 
-@rel_group.command(name="top", description="Show strongest relationships for a character (optionally filter by type).")
-@app_commands.describe(type="Optional: romantic / platonic / familial / all")
-@app_commands.choices(type=REL_TYPE_PLUS_ALL_CHOICES)
-@app_commands.autocomplete(name=character_autocomplete)
-async def rel_top(
-    interaction: discord.Interaction,
-    name: str,
-    type: app_commands.Choice[str],
-):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-
-    name = name.strip()
-    chosen = (type.value or "all").strip().lower()
-
-    rel_type = None if chosen == "all" else normalize_rel_type(chosen)
-
-    rows = top_relationships_for(guild_id, name, rel_type=rel_type, limit=10)
-    if not rows:
-        return await interaction.response.send_message(f"No relationships tracked yet for **{name}**.", ephemeral=True)
-
-    lines = []
-    for r in rows:
-        score = int(r["score"])
-        rt = r["rel_type"]
-        lines.append(f"• **{r['other']}** — `{score}` ({stage_label(score, rt)})  ·  *{rt}*")
-
-    title = f"Top relationships for {name}" + (f" ({rel_type_title(rel_type)})" if rel_type else "")
-    embed = discord.Embed(title=title, description="\n".join(lines), color=0x34495E)
-    await interaction.response.send_message(embed=embed)
-
-
 @rel_group.command(name="view", description="View relationship meter between two characters.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
+@app_commands.choices(rel_type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 async def rel_view(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
+    rel_type: app_commands.Choice[str],
     a: str,
-    b: str
+    b: str,
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
@@ -1228,26 +943,37 @@ async def rel_view(
     if a.casefold() == b.casefold():
         return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
 
-    rel_type = type.value
-    row = get_relationship(guild_id, a, b, rel_type)
+    rt = rel_type.value
+    row = get_relationship(guild_id, a, b, rt)
     score = int(row["score"]) if row else 0
     note = row.get("note") if row else None
 
-    embed = build_rel_embed(rel_type, a, b, score, note=note)
+    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
+    status = stage_label(score, rt)
+    mood = mood_line(score, rt)
+    heat = heat_emoji(score)
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} {meta['title']}: {a} ↔ {b}",
+        description=f"{heat} **{score}** • **{status}**\n`{meter_bar(score)}`\n*{mood}*",
+    )
+    if note:
+        embed.add_field(name="Note", value=note, inline=False)
+
     await interaction.response.send_message(embed=embed)
 
 
 @rel_group.command(name="set", description="Set relationship score (-100 to +100).")
-@app_commands.choices(type=REL_TYPE_CHOICES)
+@app_commands.choices(rel_type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(score="Integer from -100 to 100", note="Optional note")
 async def rel_set(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
+    rel_type: app_commands.Choice[str],
     a: str,
     b: str,
     score: int,
-    note: Optional[str] = None
+    note: Optional[str] = None,
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
@@ -1257,41 +983,51 @@ async def rel_set(
     if a.casefold() == b.casefold():
         return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
 
-    rel_type = type.value
+    rt = rel_type.value
 
-    # Auto-create characters
     if not character_exists(guild_id, a):
         add_character(guild_id, a)
     if not character_exists(guild_id, b):
         add_character(guild_id, b)
 
-    prev = get_relationship(guild_id, a, b, rel_type)
+    prev = get_relationship(guild_id, a, b, rt)
     old = int(prev["score"]) if prev else 0
 
     final = upsert_relationship(
         guild_id=guild_id,
         name1=a,
         name2=b,
-        rel_type=rel_type,
+        rel_type=rt,
         new_score=score,
         updated_by=interaction.user.display_name,
         note=note,
         delta_for_history=(clamp_score(score) - old),
         reason="SET",
-        is_player_action=True,
     )
 
-    milestone = milestone_message(old, final, rel_type)
-    extra = None
-    if milestone:
-        extra = milestone
+    milestone = milestone_message(old, final, rt)
 
-    embed = build_rel_embed(rel_type, a, b, final, note=note, extra=extra)
+    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
+    status = stage_label(final, rt)
+    mood = mood_line(final, rt)
+    heat = heat_emoji(final)
+
+    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*"
+    if milestone:
+        desc += f"\n\n{milestone}"
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} Set {meta['title']}: {a} ↔ {b}",
+        description=desc,
+    )
+    if note:
+        embed.add_field(name="Note", value=note, inline=False)
+
     await interaction.response.send_message(embed=embed)
 
     await post_milestone_log(
         interaction=interaction,
-        rel_type=rel_type,
+        rel_type=rt,
         a=a,
         b=b,
         old_score=old,
@@ -1302,16 +1038,16 @@ async def rel_set(
 
 
 @rel_group.command(name="add", description="Adjust relationship score by a delta (e.g., -10 or +25).")
-@app_commands.choices(type=REL_TYPE_CHOICES)
+@app_commands.choices(rel_type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(delta="Change amount (e.g., -10 or +15)", reason="Optional reason")
 async def rel_add(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
+    rel_type: app_commands.Choice[str],
     a: str,
     b: str,
     delta: int,
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
@@ -1321,39 +1057,49 @@ async def rel_add(
     if a.casefold() == b.casefold():
         return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
 
-    rel_type = type.value
+    rt = rel_type.value
 
     if not character_exists(guild_id, a):
         add_character(guild_id, a)
     if not character_exists(guild_id, b):
         add_character(guild_id, b)
 
-    prev = get_relationship(guild_id, a, b, rel_type)
+    prev = get_relationship(guild_id, a, b, rt)
     old_score = int(prev["score"]) if prev else 0
 
     final = add_to_relationship(
         guild_id=guild_id,
         name1=a,
         name2=b,
-        rel_type=rel_type,
+        rel_type=rt,
         delta=delta,
         updated_by=interaction.user.display_name,
-        reason=reason
+        reason=reason,
     )
 
-    milestone = milestone_message(old_score, final, rel_type)
-    extra = f"**Delta:** `{delta:+d}`"
-    if reason:
-        extra += f"\n**Reason:** {reason}"
-    if milestone:
-        extra += f"\n\n{milestone}"
+    milestone = milestone_message(old_score, final, rt)
 
-    embed = build_rel_embed(rel_type, a, b, final, extra=extra)
+    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
+    status = stage_label(final, rt)
+    mood = mood_line(final, rt)
+    heat = heat_emoji(final)
+
+    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*\n\n**Delta:** `{delta:+d}`"
+    if reason:
+        desc += f"\n**Reason:** {reason}"
+    if milestone:
+        desc += f"\n\n{milestone}"
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} Updated {meta['title']}: {a} ↔ {b}",
+        description=desc,
+    )
+
     await interaction.response.send_message(embed=embed)
 
     await post_milestone_log(
         interaction=interaction,
-        rel_type=rel_type,
+        rel_type=rt,
         a=a,
         b=b,
         old_score=old_score,
@@ -1364,267 +1110,138 @@ async def rel_add(
 
 
 @rel_group.command(name="history", description="Show recent changes for a relationship meter.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
+@app_commands.choices(rel_type=REL_TYPE_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(limit="How many entries (max 15)")
-async def rel_history_cmd(
+async def rel_history(
     interaction: discord.Interaction,
-    type: app_commands.Choice[str],
+    rel_type: app_commands.Choice[str],
     a: str,
     b: str,
-    limit: int = 10
+    limit: int = 10,
 ):
     guild_id = ensure_guild(interaction)
     if not guild_id:
         return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
 
     limit = max(1, min(15, int(limit)))
-    rel_type = type.value
+    rt = rel_type.value
 
-    rows = fetch_history(guild_id, a, b, rel_type, limit=limit)
+    rows = fetch_history(guild_id, a, b, rt, limit=limit)
     if not rows:
-        return await interaction.response.send_message("No history yet for that pair/type.", ephemeral=True)
+        return await interaction.response.send_message("No history yet for that pair/type.")
 
     lines = []
     for r in rows:
-        delta_i = int(r["delta"])
-        new_i = int(r["new_score"])
-        by = r["updated_by"]
-        at = r["updated_at"]
-        why = r.get("reason") or ""
-        why_part = f" — {why}" if why else ""
-        lines.append(f"• `{delta_i:+d}` → `{new_i}` by **{by}** ({at}){why_part}")
-
-    embed = discord.Embed(
-        title=f"History ({rel_type_title(rel_type)}): {a} ↔ {b}",
-        description="\n".join(lines),
-        color=0x7F8C8D
-    )
-    await interaction.response.send_message(embed=embed)
-
-
-# =============================
-# /decay GROUP (DECAY + FREEZE CONTROLS)
-# =============================
-decay_group = app_commands.Group(name="decay", description="Decay + freeze controls (server-wide & per relationship).")
-
-
-@decay_group.command(name="show", description="Show current decay settings for this server.")
-async def decay_show(interaction: discord.Interaction):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    rows = get_decay_settings_rows(guild_id)
-    paused_until_iso = rows[0].get("paused_until") if rows else None
-
-    lines = []
-    if paused_until_iso:
-        pu = parse_iso(paused_until_iso)
-        if pu and now_utc() < pu:
-            lines.append(f"⏸️ **Decay paused until:** `{paused_until_iso}`")
-        else:
-            lines.append("⏸️ **Decay pause:** (not active)")
-
-    for r in rows:
         lines.append(
-            f"• **{r['rel_type']}** — "
-            f"{'✅ ON' if r['enabled'] else '❌ OFF'} | "
-            f"amount `{r['decay_amount']}` | every `{r['interval_minutes']}m` | "
-            f"cooldown `{r['cooldown_minutes']}m`"
-            + (f" | freeze_familial `{r['freeze_familial']}`" if r["rel_type"] == "romantic" else "")
-        )
-
-    await interaction.response.send_message("\n".join(lines) if lines else "No decay settings found.", ephemeral=True)
-
-
-@decay_group.command(name="enable", description="Enable decay for a relationship type.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-async def decay_enable(interaction: discord.Interaction, type: app_commands.Choice[str]):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    set_decay_settings(guild_id, type.value, enabled=True)
-    await interaction.response.send_message(f"✅ Decay enabled for **{type.value}**.", ephemeral=True)
-
-
-@decay_group.command(name="disable", description="Disable decay for a relationship type.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-async def decay_disable(interaction: discord.Interaction, type: app_commands.Choice[str]):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    set_decay_settings(guild_id, type.value, enabled=False)
-    await interaction.response.send_message(f"✅ Decay disabled for **{type.value}**.", ephemeral=True)
-
-
-@decay_group.command(name="configure", description="Configure decay: amount, interval, cooldown (per type).")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-@app_commands.describe(
-    amount="Points per tick (1-10 recommended)",
-    interval_minutes="Minutes per tick (10..10080)",
-    cooldown_minutes="No decay for this many minutes after last player update (0..43200)"
-)
-async def decay_configure(
-    interaction: discord.Interaction,
-    type: app_commands.Choice[str],
-    amount: int,
-    interval_minutes: int,
-    cooldown_minutes: int,
-):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    amount = max(1, min(10, int(amount)))
-    interval_minutes = max(10, min(10080, int(interval_minutes)))  # 10m .. 7d
-    cooldown_minutes = max(0, min(43200, int(cooldown_minutes)))   # up to 30 days
-
-    set_decay_settings(
-        guild_id=guild_id,
-        rel_type=type.value,
-        decay_amount=amount,
-        interval_minutes=interval_minutes,
-        cooldown_minutes=cooldown_minutes
-    )
-
-    await interaction.response.send_message(
-        f"✅ **{type.value}** decay updated: amount `{amount}`, interval `{interval_minutes}m`, cooldown `{cooldown_minutes}m`.",
-        ephemeral=True
-    )
-
-
-@decay_group.command(name="pause", description="Pause ALL decay for this server for N hours.")
-@app_commands.describe(hours="How long to pause decay (1..168)")
-async def decay_pause(interaction: discord.Interaction, hours: int):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    hours = max(1, min(168, int(hours)))  # up to 7 days
-    until = now_utc() + timedelta(hours=hours)
-    set_pause_all_decay(guild_id, until.isoformat(timespec="seconds"))
-    await interaction.response.send_message(f"⏸️ Decay paused for `{hours}` hour(s).", ephemeral=True)
-
-
-@decay_group.command(name="resume", description="Resume decay immediately (clear server pause).")
-async def decay_resume(interaction: discord.Interaction):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    set_pause_all_decay(guild_id, None)
-    await interaction.response.send_message("▶️ Decay resumed.", ephemeral=True)
-
-
-@decay_group.command(name="freeze-familial", description="Freeze or allow familial decay (server-wide lever).")
-@app_commands.describe(enabled="If true, familial relationships will not decay.")
-async def decay_freeze_familial(interaction: discord.Interaction, enabled: bool):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    # store on all rows (simple)
-    for rt in REL_TYPES:
-        set_decay_settings(guild_id, rt, freeze_familial=enabled)
-
-    await interaction.response.send_message(
-        f"✅ freeze_familial set to `{enabled}` (familial decay {'disabled' if enabled else 'enabled'}).",
-        ephemeral=True
-    )
-
-
-@decay_group.command(name="freeze", description="Freeze decay for ONE relationship meter for N hours.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-@app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
-@app_commands.describe(hours="Freeze duration (1..720)", reason="Optional note why it’s frozen")
-async def decay_freeze(
-    interaction: discord.Interaction,
-    type: app_commands.Choice[str],
-    a: str,
-    b: str,
-    hours: int,
-    reason: Optional[str] = None
-):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    hours = max(1, min(720, int(hours)))  # up to 30 days
-    rel_type = type.value
-    until = now_utc() + timedelta(hours=hours)
-
-    upsert_freeze(
-        guild_id=guild_id,
-        name1=a,
-        name2=b,
-        rel_type=rel_type,
-        freeze_until_iso=until.isoformat(timespec="seconds"),
-        reason=reason,
-        created_by=interaction.user.display_name
-    )
-
-    await interaction.response.send_message(
-        f"🧊 Frozen **{rel_type}** decay for **{a} ↔ {b}** until `{until.isoformat(timespec='seconds')}`.",
-        ephemeral=True
-    )
-
-
-@decay_group.command(name="unfreeze", description="Remove freeze from ONE relationship meter.")
-@app_commands.choices(type=REL_TYPE_CHOICES)
-@app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
-async def decay_unfreeze(
-    interaction: discord.Interaction,
-    type: app_commands.Choice[str],
-    a: str,
-    b: str,
-):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    rel_type = type.value
-    deleted = clear_freeze(guild_id, a, b, rel_type)
-    if deleted <= 0:
-        return await interaction.response.send_message("No freeze found for that pair/type.", ephemeral=True)
-
-    await interaction.response.send_message(f"✅ Unfroze **{rel_type}** decay for **{a} ↔ {b}**.", ephemeral=True)
-
-
-@decay_group.command(name="frozen", description="List all currently frozen relationships in this server.")
-async def decay_frozen_list(interaction: discord.Interaction):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-
-    rows = list_freezes(guild_id)
-    if not rows:
-        return await interaction.response.send_message("No frozen relationships.", ephemeral=True)
-
-    now = now_utc()
-    lines = []
-    for r in rows[:50]:
-        until_dt = parse_iso(r["freeze_until"])
-        if until_dt and until_dt <= now:
-            continue
-        lines.append(
-            f"• **{r['rel_type']}** — **{r['a_name']} ↔ {r['b_name']}** until `{r['freeze_until']}`"
+            f"• `{int(r['delta']):+d}` → `{int(r['new_score'])}` by **{r['updated_by']}** ({r['updated_at']})"
             + (f" — {r['reason']}" if r.get("reason") else "")
         )
 
-    if not lines:
-        return await interaction.response.send_message("No currently active freezes (some may have expired).", ephemeral=True)
-
-    if len(rows) > 50:
-        lines.append(f"… and {len(rows) - 50} more (showing first 50).")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    embed = discord.Embed(title=f"History ({rel_type_title(rt)}): {a} ↔ {b}", description="\n".join(lines))
+    await interaction.response.send_message(embed=embed)
 
 
-# =============================
+# ============================================================
+# /EVENT GROUP  (ROLL POSITIVE / NEGATIVE / MIXED EVENTS)
+# ============================================================
+event_group = app_commands.Group(name="event", description="Roll Blackthorn events that change relationship meters.")
+
+
+@event_group.command(name="roll", description="Roll a Blackthorn event and apply its delta.")
+@app_commands.choices(rel_type=REL_TYPE_CHOICES, intensity=INTENSITY_CHOICES, polarity=POLARITY_CHOICES)
+@app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
+@app_commands.describe(
+    rel_type="Which meter type to affect",
+    a="Character A",
+    b="Character B",
+    intensity="How big the story beat is",
+    polarity="Force a positive or negative beat (or mixed)",
+)
+async def event_roll(
+    interaction: discord.Interaction,
+    rel_type: app_commands.Choice[str],
+    a: str,
+    b: str,
+    intensity: app_commands.Choice[str],
+    polarity: app_commands.Choice[str],
+):
+    guild_id = ensure_guild(interaction)
+    if not guild_id:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+
+    a, b = a.strip(), b.strip()
+    if a.casefold() == b.casefold():
+        return await interaction.response.send_message("Pick two different characters.", ephemeral=True)
+
+    rt = rel_type.value
+    inten = intensity.value
+    pol = polarity.value if polarity else "mixed"
+
+    if not character_exists(guild_id, a):
+        add_character(guild_id, a)
+    if not character_exists(guild_id, b):
+        add_character(guild_id, b)
+
+    prev = get_relationship(guild_id, a, b, rt)
+    old_score = int(prev["score"]) if prev else 0
+
+    # Seed for deterministic roll per command
+    ev = roll_event(rt, inten, pol, seed=int(interaction.id))
+    delta = int(ev.delta)
+
+    final = add_to_relationship(
+        guild_id=guild_id,
+        name1=a,
+        name2=b,
+        rel_type=rt,
+        delta=delta,
+        updated_by=interaction.user.display_name,
+        reason=f"EVENT ROLL [{inten.upper()}/{pol.upper()}]: {ev.title}",
+    )
+
+    milestone = milestone_message(old_score, final, rt)
+
+    meta = REL_TYPE_META.get(rt, {"emoji": "🎲", "title": rel_type_title(rt)})
+    status = stage_label(final, rt)
+    mood = mood_line(final, rt)
+    heat = heat_emoji(final)
+
+    sign = "✅" if delta > 0 else ("⚠️" if delta < 0 else "➖")
+    desc = (
+        f"**{ev.title}** {sign}\n"
+        f"*{ev.description}*\n\n"
+        f"**Impact:** `{delta:+d}`  |  **Score:** `{old_score}` → `{final}`\n"
+        f"{heat} **{status}**\n"
+        f"`{meter_bar(final)}`\n"
+        f"*{mood}*"
+    )
+    if milestone:
+        desc += f"\n\n{milestone}"
+
+    embed = discord.Embed(
+        title=f"{meta['emoji']} Event Roll — {meta['title']}: {a} ↔ {b}",
+        description=desc,
+    )
+    embed.set_footer(text=f"Intensity: {inten} • Polarity: {pol} • Seed: {interaction.id}")
+
+    await interaction.response.send_message(embed=embed)
+
+    await post_milestone_log(
+        interaction=interaction,
+        rel_type=rt,
+        a=a,
+        b=b,
+        old_score=old_score,
+        new_score=final,
+        delta=delta,
+        reason=f"EVENT ROLL [{inten.upper()}/{pol.upper()}]: {ev.title}",
+    )
+
+
+# ============================================================
 # RUN
-# =============================
+# ============================================================
 def main():
     if not TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN env var.")
