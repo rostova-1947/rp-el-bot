@@ -53,8 +53,6 @@ INTENSITY_CHOICES = [
     app_commands.Choice(name="high", value="high"),
 ]
 
-# This is the change you asked for:
-# users can force the roll to be Positive or Negative (or let it be Mixed)
 POLARITY_CHOICES = [
     app_commands.Choice(name="mixed", value="mixed"),
     app_commands.Choice(name="positive", value="positive"),
@@ -88,7 +86,6 @@ def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
 
-    # --- Base tables ---
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS characters (
@@ -133,7 +130,6 @@ def db_init() -> None:
     """
     )
 
-    # --- Per-guild settings (milestone log channel) ---
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS guild_settings (
@@ -143,7 +139,7 @@ def db_init() -> None:
     """
     )
 
-    # --- Migration: ensure rel_type exists + backfill ---
+    # Migration: rel_type backfill
     cur.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS rel_type TEXT;")
     cur.execute("ALTER TABLE rel_history ADD COLUMN IF NOT EXISTS rel_type TEXT;")
     cur.execute("UPDATE relationships SET rel_type='platonic' WHERE rel_type IS NULL;")
@@ -151,14 +147,13 @@ def db_init() -> None:
     cur.execute("ALTER TABLE relationships ALTER COLUMN rel_type SET NOT NULL;")
     cur.execute("ALTER TABLE rel_history ALTER COLUMN rel_type SET NOT NULL;")
 
-    # --- Unique indexes ---
+    # Uniques
     cur.execute(
         """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_characters_guild_lower_name
     ON characters (guild_id, lower(name));
     """
     )
-
     cur.execute("DROP INDEX IF EXISTS ux_relationships_guild_lower_pair;")
     cur.execute(
         """
@@ -421,170 +416,10 @@ def top_relationships_for(guild_id: str, name: str, rel_type: Optional[str] = No
 
 
 # ============================================================
-# GUILD SETTINGS (MILESTONE LOG CHANNEL)
+# DISPLAY (COMPACT, NO FLAVOR)
 # ============================================================
-def get_log_channel_id(guild_id: str) -> Optional[int]:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=%s", (guild_id,))
-    row = cur.fetchone()
-    cur.close()
-    con.close()
-    if not row or not row[0]:
-        return None
-    try:
-        return int(row[0])
-    except ValueError:
-        return None
-
-
-def set_log_channel_id(guild_id: str, channel_id: int) -> None:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO guild_settings (guild_id, log_channel_id)
-        VALUES (%s, %s)
-        ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = EXCLUDED.log_channel_id
-        """,
-        (guild_id, str(channel_id)),
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-def clear_log_channel_id(guild_id: str) -> None:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO guild_settings (guild_id, log_channel_id)
-        VALUES (%s, NULL)
-        ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = NULL
-        """,
-        (guild_id,),
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
-
-# ============================================================
-# BLACKTHORN DISPLAY HELPERS + MILESTONES
-# ============================================================
-BLACKTHORN_STAGES = {
-    "romantic": [
-        (-85, "Blood in the Water"),
-        (-60, "Cutthroat"),
-        (-30, "Bad History"),
-        (10, "Playing It Cool"),
-        (35, "Slowburn"),
-        (65, "Back in the Saddle"),
-        (100, "Endgame"),
-    ],
-    "platonic": [
-        (-85, "Kill-on-Sight"),
-        (-60, "No-Contact"),
-        (-30, "Thin Ice"),
-        (20, "Town-Polite"),
-        (50, "Good Company"),
-        (80, "Ride-or-Die"),
-        (100, "Chosen Family"),
-    ],
-    "familial": [
-        (-90, "Scorched Earth"),
-        (-70, "Cut Off"),
-        (-40, "Bad Blood"),
-        (15, "Holding Pattern"),
-        (45, "Mending Fences"),
-        (75, "Blood & Bone"),
-        (100, "Unbreakable"),
-    ],
-}
-
-REL_TYPE_META = {
-    "romantic": {"emoji": "💘", "title": "Romantic"},
-    "platonic": {"emoji": "🤝", "title": "Platonic"},
-    "familial": {"emoji": "🧬", "title": "Familial"},
-}
-
-
 def ensure_guild(interaction: discord.Interaction) -> Optional[str]:
     return str(interaction.guild.id) if interaction.guild else None
-
-
-def rel_type_title(rt: str) -> str:
-    rt = normalize_rel_type(rt)
-    return rt.capitalize()
-
-
-def stage_label(score: int, rel_type: str = "platonic") -> str:
-    rel_type = normalize_rel_type(rel_type)
-    score = clamp_score(score)
-    for upper, label in BLACKTHORN_STAGES[rel_type]:
-        if score <= upper:
-            return label
-    return BLACKTHORN_STAGES[rel_type][-1][1]
-
-
-def mood_line(score: int, rel_type: str) -> str:
-    rel_type = normalize_rel_type(rel_type)
-    score = clamp_score(score)
-
-    if rel_type == "romantic":
-        if score <= -85:
-            return "Spite with a pulse. Somebody’s gonna bleed first."
-        if score <= -60:
-            return "Every look is a dare. Every word lands like a hook."
-        if score <= -30:
-            return "Chemistry they refuse to name. History they can’t outrun."
-        if score <= 10:
-            return "Careful distance. Watching for weakness. Wanting anyway."
-        if score <= 35:
-            return "Soft spots showing. Small mercies. Dangerous tenderness."
-        if score <= 65:
-            return "They keep finding their way back. Even when it’s stupid."
-        return "It’s settled. This is the person they pick—again and again."
-
-    if rel_type == "familial":
-        if score <= -90:
-            return "The kind of feud that poisons holidays."
-        if score <= -70:
-            return "Doors closed. Names not spoken."
-        if score <= -40:
-            return "Love is there—under the anger."
-        if score <= 15:
-            return "Quiet tension. Things left unsaid on purpose."
-        if score <= 45:
-            return "Trying. Showing up. Mending what can be mended."
-        if score <= 75:
-            return "Loyalty that hurts. Pride that runs deep."
-        return "No matter what—blood shows up."
-
-    # platonic
-    if score <= -85:
-        return "They’d cross the street rather than share air."
-    if score <= -60:
-        return "Bad for business. Worse for the heart."
-    if score <= -30:
-        return "One wrong move and it turns ugly."
-    if score <= 20:
-        return "Civil. Not close. Not cruel."
-    if score <= 50:
-        return "Easy laughs. Mutual respect. Same side, mostly."
-    if score <= 80:
-        return "If it goes down, they’re in it together."
-    return "Family by choice. The real kind."
-
-
-def milestone_message(old_score: int, new_score: int, rel_type: str) -> Optional[str]:
-    rel_type = normalize_rel_type(rel_type)
-    old_stage = stage_label(old_score, rel_type)
-    new_stage = stage_label(new_score, rel_type)
-    if old_stage == new_stage:
-        return None
-    return f"🏁 **Milestone:** *{old_stage}* → **{new_stage}**"
 
 
 def meter_bar(score: int, width: int = 22) -> str:
@@ -615,173 +450,41 @@ def heat_emoji(score: int) -> str:
     return "🟣"
 
 
-async def post_milestone_log(
-    interaction: discord.Interaction,
-    rel_type: str,
-    a: str,
-    b: str,
-    old_score: int,
-    new_score: int,
-    delta: Optional[int],
-    reason: Optional[str],
-):
-    """Logs ONLY milestones to the configured log channel (if set)."""
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return
-
-    milestone = milestone_message(old_score, new_score, rel_type)
-    if not milestone:
-        return
-
-    chan_id = get_log_channel_id(guild_id)
-    if not chan_id:
-        return
-
-    channel = interaction.client.get_channel(chan_id)
-    if channel is None:
-        try:
-            channel = await interaction.client.fetch_channel(chan_id)
-        except Exception:
-            return
-
-    rel_type = normalize_rel_type(rel_type)
-    meta = REL_TYPE_META.get(rel_type, {"emoji": "🔗", "title": rel_type_title(rel_type)})
-
-    status = stage_label(new_score, rel_type)
-    mood = mood_line(new_score, rel_type)
-    heat = heat_emoji(new_score)
-
-    delta_part = f" `{delta:+d}`" if delta is not None else ""
-    reason_part = f"\n**Reason:** {reason}" if reason else ""
-
-    msg = (
-        f"{meta['emoji']} **{meta['title']} Milestone** — **{a} ↔ {b}**\n"
-        f"{milestone}\n"
-        f"{heat} **Score:** `{old_score}` → `{new_score}`{delta_part}  |  **Now:** **{status}**\n"
-        f"*{mood}*"
-        f"{reason_part}\n"
-        f"**By:** {interaction.user.mention}"
-    )
-
-    try:
-        await channel.send(msg)
-    except Exception:
-        return
-
-
 # ============================================================
-# EVENT TABLE → POSITIVE OR NEGATIVE FILTER
+# RANDOM DELTA RANGES (INTENSITY × POLARITY)
 # ============================================================
-@dataclass(frozen=True)
-class EventDef:
-    title: str
-    description: str
-    delta: int  # positive or negative
-
-
-EVENT_TABLE: Dict[str, Dict[str, List[EventDef]]] = {
-    "romantic": {
-        "low": [
-            EventDef("Arena Lights", "Caught staring too long under the arena lights. Neither looks away first.", +5),
-            EventDef("Shared Cigarette", "A cigarette passed between them like a truce no one agreed to out loud.", +3),
-            EventDef("Sharp Words, Soft Eyes", "They snap, but the way they watch each other gives it away.", +2),
-            EventDef("Bad Timing", "They reach for each other—then remember they’re not supposed to.", -3),
-            EventDef("Old Wound (Mentioned)", "Somebody brings up Teddy. The air goes cold. Old pain resurfaces.", -5),
-            EventDef("Diner Humiliation", "A public comment lands wrong at the diner. Everyone hears it.", -6),
-        ],
-        "med": [
-            EventDef("Porch Patch-Up", "A patch-up on the porch at 2am. Quiet voices. No witnesses.", +10),
-            EventDef("Jealousy Spike", "Someone laughs too close to one of them. The other goes rigid.", +6),
-            EventDef("Truck Bed Confession", "In the truck bed, under stars, the truth leaks out in pieces.", +8),
-            EventDef("Public Humiliation", "A public humiliation at the diner. Pride gets dragged through gravel.", -12),
-            EventDef("Old Wound Reopened", "The Teddy subject isn’t avoided this time. It cracks something open.", -10),
-            EventDef("Fistfight Energy", "It’s not a fight… but it feels like one. One wrong word and it’ll swing.", -8),
-        ],
-        "high": [
-            EventDef("End of the Leash", "They finally say what they’ve been circling for months. It’s ugly and honest.", +15),
-            EventDef("Aftercare", "Bandages, water, steady hands. The kind of care that changes things.", +12),
-            EventDef("Kiss Like a Threat", "It’s not tender. It’s a decision. A line crossed on purpose.", +14),
-            EventDef("Burned Bridge", "A betrayal—real or perceived. Something breaks in a way that echoes.", -18),
-            EventDef("Ranch War", "The families get involved. They choose sides. The choosing hurts.", -15),
-            EventDef("Cruel in Public", "They go cruel in public to protect a private softness. The damage is real.", -16),
-        ],
+# You asked: "general values with a range for low/med/high polarity with randomness"
+# Here "intensity" controls magnitude; "polarity" controls sign bias.
+DELTA_RANGES: Dict[str, Dict[str, Tuple[int, int]]] = {
+    "low": {
+        "positive": (1, 6),
+        "negative": (-6, -1),
+        "mixed": (-3, 3),
     },
-    "platonic": {
-        "low": [
-            EventDef("Shared Work", "Fences, feed, and silence. Respect earned the old way.", +4),
-            EventDef("Inside Joke", "A small joke lands. For a second, it feels easy.", +3),
-            EventDef("Town-Polite", "A nod in passing. Civil. Not warm—managed.", +2),
-            EventDef("Thin Ice", "A harmless comment hits a nerve. The mood shifts fast.", -3),
-            EventDef("Shoulder Check", "A deliberate shoulder check—petty, but pointed.", -2),
-            EventDef("Bad Rumor", "They hear something said behind their back. They don’t forget.", -4),
-        ],
-        "med": [
-            EventDef("Backed Up", "When it counted, they showed up. No questions. No hesitation.", +10),
-            EventDef("Ride Together", "Same truck, same road, same problem. Suddenly they’re a team.", +8),
-            EventDef("Saved Face", "One of them saves the other’s dignity in front of the town.", +7),
-            EventDef("Public Argument", "Voices raised where everyone can hear. Pride takes the wheel.", -9),
-            EventDef("Crossed Line", "Someone crosses a boundary. The apology comes late.", -10),
-            EventDef("No Contact", "They shut the door. Not dramatic—final.", -12),
-        ],
-        "high": [
-            EventDef("Ride-or-Die", "They go down together before they go down alone.", +15),
-            EventDef("Chosen Family", "Not blood. Better. They claim each other anyway.", +16),
-            EventDef("Kept the Secret", "A secret held, a risk taken. Loyalty proven.", +14),
-            EventDef("Betrayal", "They sell each other out—on purpose or by accident. Either way: bitter.", -16),
-            EventDef("Hands Thrown", "It goes physical. Not playful. Nobody wins.", -18),
-            EventDef("Cut Deep", "Words said that can’t be unsaid. The town will repeat them for weeks.", -15),
-        ],
+    "med": {
+        "positive": (5, 12),
+        "negative": (-12, -5),
+        "mixed": (-8, 8),
     },
-    "familial": {
-        "low": [
-            EventDef("Showed Up", "They show up anyway. That’s the whole love language.", +4),
-            EventDef("Kitchen Truce", "Coffee poured. Plates set. A truce made with chores and silence.", +3),
-            EventDef("Small Mercy", "An apology in actions, not words.", +2),
-            EventDef("Old Grudge", "An old grudge slips out mid-sentence. Everybody tenses.", -4),
-            EventDef("Cold Shoulder", "They freeze each other out like it’s second nature.", -3),
-            EventDef("Bad Blood", "Someone brings up the past like it’s a weapon.", -5),
-        ],
-        "med": [
-            EventDef("Mending Fences", "Actual fences, and the other kind. They work without speaking much.", +10),
-            EventDef("Protective Instinct", "Family closes ranks. Somebody gets protected whether they deserve it or not.", +8),
-            EventDef("Blood & Bone", "They take the hit for each other. Without asking.", +12),
-            EventDef("Cut Off", "They cut contact. Holiday-level consequences.", -12),
-            EventDef("Blowup", "It’s a blowup that rattles the whole house.", -10),
-            EventDef("Line in the Sand", "A line gets drawn. Somebody stands on the wrong side.", -11),
-        ],
-        "high": [
-            EventDef("Unbreakable", "They prove it: no matter what, they show up.", +16),
-            EventDef("Shared Grief", "Grief softens what anger couldn’t. They let each other in.", +14),
-            EventDef("Protect the Name", "They defend the family name like it’s sacred.", +12),
-            EventDef("Scorched Earth", "They go scorched earth. Thanksgivings will remember.", -18),
-            EventDef("Inheritance Fight", "Money, land, legacy—every old wound shows its teeth.", -16),
-            EventDef("Public Shame", "Family business becomes town business. Shame spreads fast.", -15),
-        ],
+    "high": {
+        "positive": (10, 20),
+        "negative": (-20, -10),
+        "mixed": (-15, 15),
     },
 }
 
 
-def _polarity_filter(events: List[EventDef], polarity: str) -> List[EventDef]:
-    p = (polarity or "mixed").strip().lower()
-    if p == "positive":
-        return [e for e in events if e.delta > 0] or events
-    if p == "negative":
-        return [e for e in events if e.delta < 0] or events
-    return events
+def roll_delta(intensity: str, polarity: str, seed: int) -> int:
+    inten = (intensity or "med").strip().lower()
+    pol = (polarity or "mixed").strip().lower()
+    if inten not in DELTA_RANGES:
+        inten = "med"
+    if pol not in DELTA_RANGES[inten]:
+        pol = "mixed"
 
-
-def roll_event(rel_type: str, intensity: str, polarity: str, seed: int) -> EventDef:
-    rel_type = normalize_rel_type(rel_type)
-    intensity = (intensity or "med").strip().lower()
-    if intensity not in ("low", "med", "high"):
-        intensity = "med"
-
-    base = EVENT_TABLE[rel_type][intensity]
-    pool = _polarity_filter(base, polarity)
-
-    rng = random.Random(seed)  # deterministic per interaction.id
-    return rng.choice(pool)
+    lo, hi = DELTA_RANGES[inten][pol]
+    rng = random.Random(seed)
+    return int(rng.randint(lo, hi))
 
 
 # ============================================================
@@ -796,10 +499,9 @@ class RPBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        # Add groups BEFORE syncing (fixes "commands not appearing")
+        # IMPORTANT: add commands before sync (fixes "slash commands not working/appearing")
         self.tree.add_command(char_group)
         self.tree.add_command(rel_group)
-        self.tree.add_command(settings_group)
         self.tree.add_command(event_group)
 
         if GUILD_ID:
@@ -824,7 +526,7 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
 
 
 # ============================================================
-# /CHAR GROUP
+# /CHAR
 # ============================================================
 char_group = app_commands.Group(name="char", description="Manage RP characters (per server).")
 
@@ -881,47 +583,7 @@ async def char_remove(interaction: discord.Interaction, name: str):
 
 
 # ============================================================
-# /SETTINGS GROUP (LOG CHANNEL)
-# ============================================================
-settings_group = app_commands.Group(name="settings", description="Server settings for the RP bot.")
-
-
-@settings_group.command(name="set-log-channel", description="Set a channel to receive milestone logs.")
-@app_commands.describe(channel="The channel to post milestone logs into")
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-
-    set_log_channel_id(guild_id, channel.id)
-    await interaction.response.send_message(f"✅ Milestone log channel set to {channel.mention}")
-
-
-@settings_group.command(name="clear-log-channel", description="Disable milestone logging.")
-async def clear_log_channel(interaction: discord.Interaction):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-
-    clear_log_channel_id(guild_id)
-    await interaction.response.send_message("✅ Milestone logging disabled.")
-
-
-@settings_group.command(name="show", description="Show current server settings.")
-async def show_settings(interaction: discord.Interaction):
-    guild_id = ensure_guild(interaction)
-    if not guild_id:
-        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-
-    chan_id = get_log_channel_id(guild_id)
-    if chan_id:
-        await interaction.response.send_message(f"📌 Milestone log channel: <#{chan_id}>")
-    else:
-        await interaction.response.send_message("📌 Milestone log channel: (not set)")
-
-
-# ============================================================
-# /REL GROUP
+# /REL
 # ============================================================
 rel_group = app_commands.Group(name="rel", description="Track relationship meters between characters.")
 
@@ -946,20 +608,12 @@ async def rel_view(
     rt = rel_type.value
     row = get_relationship(guild_id, a, b, rt)
     score = int(row["score"]) if row else 0
-    note = row.get("note") if row else None
 
-    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
-    status = stage_label(score, rt)
-    mood = mood_line(score, rt)
     heat = heat_emoji(score)
-
     embed = discord.Embed(
-        title=f"{meta['emoji']} {meta['title']}: {a} ↔ {b}",
-        description=f"{heat} **{score}** • **{status}**\n`{meter_bar(score)}`\n*{mood}*",
+        title=f"{rt.capitalize()}: {a} ↔ {b}",
+        description=f"{heat} **{score}**\n`{meter_bar(score)}`",
     )
-    if note:
-        embed.add_field(name="Note", value=note, inline=False)
-
     await interaction.response.send_message(embed=embed)
 
 
@@ -1005,36 +659,12 @@ async def rel_set(
         reason="SET",
     )
 
-    milestone = milestone_message(old, final, rt)
-
-    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
-    status = stage_label(final, rt)
-    mood = mood_line(final, rt)
     heat = heat_emoji(final)
-
-    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*"
-    if milestone:
-        desc += f"\n\n{milestone}"
-
     embed = discord.Embed(
-        title=f"{meta['emoji']} Set {meta['title']}: {a} ↔ {b}",
-        description=desc,
+        title=f"Set {rt.capitalize()}: {a} ↔ {b}",
+        description=f"{heat} **{final}**\n`{meter_bar(final)}`",
     )
-    if note:
-        embed.add_field(name="Note", value=note, inline=False)
-
     await interaction.response.send_message(embed=embed)
-
-    await post_milestone_log(
-        interaction=interaction,
-        rel_type=rt,
-        a=a,
-        b=b,
-        old_score=old,
-        new_score=final,
-        delta=(final - old),
-        reason="SET",
-    )
 
 
 @rel_group.command(name="add", description="Adjust relationship score by a delta (e.g., -10 or +25).")
@@ -1064,9 +694,6 @@ async def rel_add(
     if not character_exists(guild_id, b):
         add_character(guild_id, b)
 
-    prev = get_relationship(guild_id, a, b, rt)
-    old_score = int(prev["score"]) if prev else 0
-
     final = add_to_relationship(
         guild_id=guild_id,
         name1=a,
@@ -1077,36 +704,12 @@ async def rel_add(
         reason=reason,
     )
 
-    milestone = milestone_message(old_score, final, rt)
-
-    meta = REL_TYPE_META.get(rt, {"emoji": "🔗", "title": rel_type_title(rt)})
-    status = stage_label(final, rt)
-    mood = mood_line(final, rt)
     heat = heat_emoji(final)
-
-    desc = f"{heat} **{final}** • **{status}**\n`{meter_bar(final)}`\n*{mood}*\n\n**Delta:** `{delta:+d}`"
-    if reason:
-        desc += f"\n**Reason:** {reason}"
-    if milestone:
-        desc += f"\n\n{milestone}"
-
     embed = discord.Embed(
-        title=f"{meta['emoji']} Updated {meta['title']}: {a} ↔ {b}",
-        description=desc,
+        title=f"Updated {rt.capitalize()}: {a} ↔ {b}",
+        description=f"{heat} **{final}**  (Δ {delta:+d})\n`{meter_bar(final)}`",
     )
-
     await interaction.response.send_message(embed=embed)
-
-    await post_milestone_log(
-        interaction=interaction,
-        rel_type=rt,
-        a=a,
-        b=b,
-        old_score=old_score,
-        new_score=final,
-        delta=delta,
-        reason=reason,
-    )
 
 
 @rel_group.command(name="history", description="Show recent changes for a relationship meter.")
@@ -1138,25 +741,25 @@ async def rel_history(
             + (f" — {r['reason']}" if r.get("reason") else "")
         )
 
-    embed = discord.Embed(title=f"History ({rel_type_title(rt)}): {a} ↔ {b}", description="\n".join(lines))
+    embed = discord.Embed(title=f"History ({rt.capitalize()}): {a} ↔ {b}", description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
 
 
 # ============================================================
-# /EVENT GROUP  (ROLL POSITIVE / NEGATIVE / MIXED EVENTS)
+# /EVENT (RANDOM RANGE ROLL)
 # ============================================================
-event_group = app_commands.Group(name="event", description="Roll Blackthorn events that change relationship meters.")
+event_group = app_commands.Group(name="event", description="Roll random deltas and apply them to a relationship meter.")
 
 
-@event_group.command(name="roll", description="Roll a Blackthorn event and apply its delta.")
+@event_group.command(name="roll", description="Roll a random delta (range by intensity/polarity) and apply it.")
 @app_commands.choices(rel_type=REL_TYPE_CHOICES, intensity=INTENSITY_CHOICES, polarity=POLARITY_CHOICES)
 @app_commands.autocomplete(a=character_autocomplete, b=character_autocomplete)
 @app_commands.describe(
     rel_type="Which meter type to affect",
     a="Character A",
     b="Character B",
-    intensity="How big the story beat is",
-    polarity="Force a positive or negative beat (or mixed)",
+    intensity="Magnitude range: low/med/high",
+    polarity="Bias: positive/negative/mixed",
 )
 async def event_roll(
     interaction: discord.Interaction,
@@ -1186,9 +789,8 @@ async def event_roll(
     prev = get_relationship(guild_id, a, b, rt)
     old_score = int(prev["score"]) if prev else 0
 
-    # Seed for deterministic roll per command
-    ev = roll_event(rt, inten, pol, seed=int(interaction.id))
-    delta = int(ev.delta)
+    # deterministic per interaction id (so discord retries don't change it)
+    delta = roll_delta(inten, pol, seed=int(interaction.id))
 
     final = add_to_relationship(
         guild_id=guild_id,
@@ -1197,46 +799,21 @@ async def event_roll(
         rel_type=rt,
         delta=delta,
         updated_by=interaction.user.display_name,
-        reason=f"EVENT ROLL [{inten.upper()}/{pol.upper()}]: {ev.title}",
+        reason=f"EVENT ROLL [{inten.upper()}/{pol.upper()}]",
     )
 
-    milestone = milestone_message(old_score, final, rt)
-
-    meta = REL_TYPE_META.get(rt, {"emoji": "🎲", "title": rel_type_title(rt)})
-    status = stage_label(final, rt)
-    mood = mood_line(final, rt)
     heat = heat_emoji(final)
-
-    sign = "✅" if delta > 0 else ("⚠️" if delta < 0 else "➖")
-    desc = (
-        f"**{ev.title}** {sign}\n"
-        f"*{ev.description}*\n\n"
-        f"**Impact:** `{delta:+d}`  |  **Score:** `{old_score}` → `{final}`\n"
-        f"{heat} **{status}**\n"
-        f"`{meter_bar(final)}`\n"
-        f"*{mood}*"
-    )
-    if milestone:
-        desc += f"\n\n{milestone}"
-
     embed = discord.Embed(
-        title=f"{meta['emoji']} Event Roll — {meta['title']}: {a} ↔ {b}",
-        description=desc,
+        title=f"Event Roll ({inten}/{pol}) — {rt.capitalize()}: {a} ↔ {b}",
+        description=(
+            f"**Delta:** `{delta:+d}`\n"
+            f"**Score:** `{old_score}` → `{final}`\n\n"
+            f"{heat} **{final}**\n`{meter_bar(final)}`"
+        ),
     )
-    embed.set_footer(text=f"Intensity: {inten} • Polarity: {pol} • Seed: {interaction.id}")
+    embed.set_footer(text=f"Seed: {interaction.id}")
 
     await interaction.response.send_message(embed=embed)
-
-    await post_milestone_log(
-        interaction=interaction,
-        rel_type=rt,
-        a=a,
-        b=b,
-        old_score=old_score,
-        new_score=final,
-        delta=delta,
-        reason=f"EVENT ROLL [{inten.upper()}/{pol.upper()}]: {ev.title}",
-    )
 
 
 # ============================================================
